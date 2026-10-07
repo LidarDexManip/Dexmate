@@ -1,0 +1,6 @@
+[submodule "dexstream"]
+	path = dexstream
+	url = https://github.com/dexmate-ai/dexstream.git
+[submodule "omniteleop"]
+	path = omniteleop
+	url = https://github.com/dexmate-ai/omniteleop.git

@@ -1,0 +1,24 @@
+# Local environments and generated dependencies
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+*.egg-info/
+
+# Robot-specific configuration and credentials
+*.dzcfg
+.env
+.env.*
+!.env.example
+
+# Local handoff archives and hardware packages
+dexmate_vega1u_handoff/
+*.deb
+*.dpfw
+*.dpsw
+*.zip
+
+# Logs and local captures
+*.log
+*.jsonl
