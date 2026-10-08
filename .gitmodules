@@ -4,3 +4,18 @@
 [submodule "omniteleop"]
 	path = omniteleop
 	url = https://github.com/dexmate-ai/omniteleop.git
+[submodule "third_party/wuji-description"]
+	path = third_party/wuji-description
+	url = https://github.com/wuji-technology/wuji-description.git
+[submodule "dexmate-urdf"]
+	path = dexmate-urdf
+	url = https://github.com/dexmate-ai/dexmate-urdf.git
+[submodule "mujoco-sim"]
+	path = mujoco-sim
+	url = https://github.com/wuji-technology/mujoco-sim.git
+[submodule "wuji-hand-teleop"]
+	path = wuji-hand-teleop
+	url = https://github.com/wuji-technology/wuji-hand-teleop.git
+[submodule "wuji-retargeting"]
+	path = wuji-retargeting
+	url = https://github.com/wuji-technology/wuji-retargeting.git

@@ -1,0 +1,6 @@
+# Install with .venv/bin/python -m pip install -r requirements-wuji-sim.txt
+wuji-sdk==2026.9.22
+mujoco==3.15.0
+numpy==2.4.6
+trimesh==5.1.1
+urdf2mjcf==0.2.39
