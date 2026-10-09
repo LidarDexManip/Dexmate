@@ -49,6 +49,15 @@ class _PivotRecordingGlovePose(_RaisedGlovePose):
         self.pivot = np.asarray(pivot).copy()
 
 
+class _TuckedTwistingGlovePose:
+    def read(self, anchor_pose, *, now=None):
+        pose = anchor_pose.copy()
+        pose[0, 3] = 0.30
+        pose[2, 3] -= 0.05
+        pose[:3, :3] = anchor_pose[:3, :3] @ _rotation_about([0, 0, 1], 0.6)
+        return ImuArmSnapshot(pose, "tracking", now, 1, 0.0, 0.0)
+
+
 def _rotation_about(axis, angle):
     x, y, z = np.asarray(axis, dtype=float) / np.linalg.norm(axis)
     k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
@@ -359,6 +368,17 @@ class VegaArmSimulationTests(unittest.TestCase):
         delta = np.asarray(report.arm_joint_peak_delta_rad)
         self.assertGreater(np.max(delta), 0.01)
         self.assertLess(np.max(delta), 0.40)
+
+    def test_glove_wrist_twists_while_elbow_tucks(self):
+        with redirect_stdout(io.StringIO()):
+            report = run(SyntheticSource("left"), finger_input="synthetic",
+                         arm_input="glove-arm", arm_imu_source=_TuckedTwistingGlovePose(),
+                         duration=0.25, headless=True)
+        delta = np.asarray(report.arm_joint_peak_delta_rad)
+        self.assertGreater(delta[3], 0.05)
+        self.assertGreater(delta[4], 0.05)
+        self.assertLess(delta[0], 0.04)
+        self.assertEqual(report.mujoco_warnings, 0)
 
 
 if __name__ == "__main__":

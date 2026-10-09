@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import queue
@@ -656,6 +656,7 @@ class ArmHandRunReport:
     arm_status: str = "tracking"
     arm_imu_displacement_estimate_m: float = 0.0
     arm_imu_max_displacement_estimate_m: float = 0.0
+    arm_imu_displacement_xyz_m: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     arm_gesture_command_m: float = 0.0
     arm_gesture_max_command_m: float = 0.0
     arm_gesture_steps: int = 0
@@ -756,6 +757,11 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                 np.clip(elbow_error, -elbow_step, elbow_step),
                 arm.lower[ELBOW_JOINT_INDEX], arm.upper[ELBOW_JOINT_INDEX])
             if abs(elbow_error) > 0.10:
+                # Keep the proximal arm still during the tuck, but let a
+                # forearm twist reach the three wrist joints immediately.
+                joint_slew[4:] = np.clip(
+                    joint_slew[4:] + np.clip(goal[4:] - joint_slew[4:], -step, step),
+                    arm.lower[4:], arm.upper[4:])
                 arm.set_target(joint_slew)
                 return
         joint_slew[:] = np.clip(
@@ -867,9 +873,15 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                                 report.arm_gesture_steps = imu_snapshot.gesture_steps
                             else:
                                 report.arm_imu_displacement_estimate_m = imu_snapshot.displacement_estimate_m
+                                report.arm_imu_displacement_xyz_m = list(imu_snapshot.displacement_xyz_m)
                                 report.arm_imu_max_displacement_estimate_m = max(
                                     report.arm_imu_max_displacement_estimate_m,
                                     imu_snapshot.max_displacement_estimate_m)
+                                x, y, z = imu_snapshot.displacement_xyz_m
+                                print(
+                                    f"IMU XYZ {time.strftime('%Y-%m-%dT%H:%M:%S')}"
+                                    f" x={x:+.4f} m y={y:+.4f} m z={z:+.4f} m",
+                                    flush=True)
                             if imu_snapshot.pose is not None:
                                 if wrist_only:
                                     arm.set_target(wrist_ik.solve(imu_snapshot.pose[:3, :3]))
@@ -965,6 +977,9 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                     if arm_input in ("glove-imu", "glove-arm"):
                         label = "tilt Δp" if arm_input == "glove-arm" else "IMU est Δp"
                         status_line += (f" | {label} {report.arm_imu_displacement_estimate_m:.3f} m"
+                                        f" xyz=({report.arm_imu_displacement_xyz_m[0]:+.3f},"
+                                        f"{report.arm_imu_displacement_xyz_m[1]:+.3f},"
+                                        f"{report.arm_imu_displacement_xyz_m[2]:+.3f})"
                                         f" (max {report.arm_imu_max_displacement_estimate_m:.3f} m)")
                     elif arm_input in GESTURE_ARM_INPUTS:
                         status_line += (f" | strokes {report.arm_gesture_steps}"

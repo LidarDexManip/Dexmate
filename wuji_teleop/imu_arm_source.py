@@ -57,6 +57,7 @@ class ImuArmSnapshot:
     displacement_estimate_m: float
     max_displacement_estimate_m: float
     gesture_steps: int = 0
+    displacement_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 class PalmImuRetargeter:
@@ -486,8 +487,10 @@ class PalmImuRetargeter:
             else:
                 pose[:3, 3] += imu_world_to_sim @ self._displacement
             self._last_pose = pose.copy()
+            displacement_xyz = tuple(float(v) for v in (pose[:3, 3] - self._anchor[:3, 3]))
             return ImuArmSnapshot(pose, self._status, self._last_received, self._samples,
-                                  displacement_m, max_displacement_m, self._gesture_steps)
+                                  displacement_m, max_displacement_m, self._gesture_steps,
+                                  displacement_xyz)
 
 
 class PalmImuArmSource:
