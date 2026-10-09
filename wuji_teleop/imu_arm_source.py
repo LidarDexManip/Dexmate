@@ -62,7 +62,10 @@ class PalmImuRetargeter:
                  stationary_accel=0.20, stationary_gyro=0.06,
                  imu_in_wrist_rotation=None, hand_in_ee_rotation=None,
                  motion_mode="relative", gesture_step=0.06,
-                 gesture_threshold=0.8, gesture_cooldown=0.45):
+                 gesture_threshold=0.8, gesture_cooldown=0.45,
+                 tilt_gain=0.50, tilt_deadband=0.05, tilt_smoothing=0.45,
+                 translation_leak=0.0, translation_limit=None,
+                 pointing_axis=None, vertical_to_forward=False):
         self.calibration_seconds = float(calibration_seconds)
         self.stale_after = float(stale_after)
         self.max_speed = float(max_speed)
@@ -74,6 +77,17 @@ class PalmImuRetargeter:
         self.gesture_step = float(gesture_step)
         self.gesture_threshold = float(gesture_threshold)
         self.gesture_cooldown = float(gesture_cooldown)
+        self.tilt_gain = float(tilt_gain)
+        self.tilt_deadband = float(tilt_deadband)
+        self.tilt_smoothing = float(tilt_smoothing)
+        self.translation_leak = float(translation_leak)
+        self.translation_limit = (None if translation_limit is None
+                                  else float(translation_limit))
+        self.vertical_to_forward = bool(vertical_to_forward)
+        axis = np.array([0.0, 0.0, 1.0] if pointing_axis is None else pointing_axis,
+                        dtype=np.float64)
+        axis_norm = float(np.linalg.norm(axis))
+        self.pointing_axis = axis / axis_norm if axis_norm > 0 else axis
         self.imu_in_wrist_R = (np.eye(3) if imu_in_wrist_rotation is None else
                                np.asarray(imu_in_wrist_rotation, dtype=np.float64).copy())
         self.hand_in_ee_R = (np.eye(3) if hand_in_ee_rotation is None else
@@ -84,12 +98,17 @@ class PalmImuRetargeter:
                     not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4) or
                     not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-4)):
                 raise ValueError(f"Expected a proper {label} rotation")
-        if (self.motion_mode not in ("relative", "gesture", "orientation") or
+        if (self.motion_mode not in ("relative", "gesture", "orientation", "tilt") or
                 self.gesture_step <= 0 or self.gesture_threshold <= 0 or
                 self.gesture_cooldown < 0 or
                 self.calibration_seconds <= 0 or self.stale_after <= 0 or
                 self.max_speed <= 0 or self.max_displacement <= 0 or
-                self.velocity_damping < 0):
+                self.velocity_damping < 0 or self.tilt_gain <= 0 or
+                self.tilt_deadband < 0 or not 0 < self.tilt_smoothing <= 1 or
+                self.translation_leak < 0 or
+                (self.translation_limit is not None and self.translation_limit <= 0) or
+                not np.isfinite(self.pointing_axis).all() or
+                not np.isclose(np.linalg.norm(self.pointing_axis), 1.0)):
             raise ValueError("Invalid palm IMU retargeter limits")
         self._lock = threading.Lock()
         self._error = None
@@ -106,6 +125,7 @@ class PalmImuRetargeter:
         self._last_integrate_us = None
         self._velocity = np.zeros(3)
         self._displacement = np.zeros(3)
+        self._translation = np.zeros(3)
         self._gesture_goal = np.zeros(3)
         self._gesture_candidate_direction = None
         self._gesture_candidate_since_us = None
@@ -151,6 +171,7 @@ class PalmImuRetargeter:
             self._last_integrate_us = None
             self._velocity[:] = 0
             self._displacement[:] = 0
+            self._translation[:] = 0
             self._gesture_goal[:] = 0
             self._gesture_candidate_direction = None
             self._gesture_candidate_since_us = None
@@ -234,7 +255,24 @@ class PalmImuRetargeter:
             gyro_norm = float(np.linalg.norm(gyro - self._gyro_bias_sensor))
             accel_norm = float(np.linalg.norm(a_world))
             if self.motion_mode == "orientation":
-                # Wrist-only control does not estimate or command translation.
+                self._last_integrate_us = timestamp_us
+                self._status = "tracking"
+                self._error = None
+                return True
+            if self.motion_mode == "tilt":
+                # Pointing covers tip direction. A short acceleration nudge
+                # covers a pull that keeps the fingers aimed the same way.
+                # The nudge leaks back to zero at rest so the arm returns
+                # with the glove instead of sticking where the accel left it.
+                nudge_limit = (min(0.30, self.max_displacement)
+                               if self.translation_limit is None else
+                               min(self.translation_limit, self.max_displacement))
+                self._integrate_velocity(dt, a_world, accel_norm, gyro_norm,
+                                         self._translation, nudge_limit)
+                if (self.translation_leak > 0 and
+                        accel_norm <= self.stationary_accel and
+                        gyro_norm <= self.stationary_gyro):
+                    self._translation *= math.exp(-self.translation_leak * dt)
                 self._last_integrate_us = timestamp_us
                 self._status = "tracking"
                 self._error = None
@@ -245,25 +283,10 @@ class PalmImuRetargeter:
                 self._status = "tracking"
                 self._error = None
                 return True
-            # Small deadband rejects fused-IMU noise. At rest, zero velocity
-            # prevents residual bias from accumulating into a position walk.
-            if accel_norm <= self.stationary_accel and gyro_norm <= self.stationary_gyro:
-                self._velocity[:] = 0
-                a_world[:] = 0
-            else:
-                self._velocity *= math.exp(-self.velocity_damping * dt)
-                self._velocity += a_world * dt
-                speed = float(np.linalg.norm(self._velocity))
-                if speed > self.max_speed:
-                    self._velocity *= self.max_speed / speed
-            self._displacement += self._velocity * dt
-            distance = float(np.linalg.norm(self._displacement))
-            if distance > self.max_displacement:
-                self._displacement *= self.max_displacement / distance
-                # Prevent continuing to push against the hard position bound.
-                self._velocity[:] = 0
-                distance = self.max_displacement
-            self._max_displacement = max(self._max_displacement, distance)
+            self._integrate_velocity(dt, a_world, accel_norm, gyro_norm,
+                                     self._displacement, self.max_displacement)
+            self._max_displacement = max(
+                self._max_displacement, float(np.linalg.norm(self._displacement)))
             self._last_integrate_us = timestamp_us
             self._status = "tracking"
             self._error = None
@@ -308,6 +331,48 @@ class PalmImuRetargeter:
         self._max_displacement = max(
             self._max_displacement, float(np.linalg.norm(self._displacement)))
 
+    def _integrate_velocity(self, dt, acceleration, accel_norm, gyro_norm, store, limit):
+        """Integrate gravity-free acceleration and hold still when the palm rests."""
+        if accel_norm <= self.stationary_accel and gyro_norm <= self.stationary_gyro:
+            self._velocity[:] = 0
+            return
+        self._velocity *= math.exp(-self.velocity_damping * dt)
+        self._velocity += acceleration * dt
+        speed = float(np.linalg.norm(self._velocity))
+        if speed > self.max_speed:
+            self._velocity *= self.max_speed / speed
+        store += self._velocity * dt
+        distance = float(np.linalg.norm(store))
+        if distance > limit:
+            store *= limit / distance
+            self._velocity[:] = 0
+
+    def _tilt_offset(self, current_rotation, anchor_rotation):
+        """Turn a change in pointing direction into a bounded arm offset.
+
+        The pointing axis is the simulated finger direction. Tipping the glove
+        swings that axis, and the swing becomes the end-effector translation.
+        A twist about the fingers does not move the axis, so it stays an
+        orientation command. The result is in the simulation frame.
+        """
+        neutral = anchor_rotation @ self.pointing_axis
+        current = current_rotation @ self.pointing_axis
+        swing = current - neutral
+        distance = float(np.linalg.norm(swing))
+        if distance <= self.tilt_deadband:
+            return np.zeros(3)
+        offset = self.tilt_gain * swing * ((distance - self.tilt_deadband) / distance)
+        if self.vertical_to_forward:
+            # Palm-down pitch tips the fingers up or down. That swing is the
+            # forward/back reach for the shoulder. Side-to-side yaw stays lateral.
+            offset = offset.copy()
+            offset[0] = offset[0] + offset[2]
+            offset[2] *= 0.15
+        magnitude = float(np.linalg.norm(offset))
+        if magnitude > self.max_displacement:
+            offset *= self.max_displacement / magnitude
+        return offset
+
     def snapshot(self, anchor_pose, *, now=None):
         """Return anchored target pose; stale/invalid input returns no update."""
         now = time.monotonic() if now is None else float(now)
@@ -344,7 +409,19 @@ class PalmImuRetargeter:
             imu_world_to_sim = ref_sim_hand_R @ ref_wrist_R.T
             pose[:3, :3] = (imu_world_to_sim @ self._last_R @
                             self.imu_in_wrist_R.T @ self.hand_in_ee_R.T)
-            pose[:3, 3] += imu_world_to_sim @ self._displacement
+            if self.motion_mode == "tilt":
+                offset = self._tilt_offset(pose[:3, :3], self._anchor[:3, :3])
+                offset = offset + imu_world_to_sim @ self._translation
+                magnitude = float(np.linalg.norm(offset))
+                if magnitude > self.max_displacement:
+                    offset *= self.max_displacement / magnitude
+                self._displacement += self.tilt_smoothing * (offset - self._displacement)
+                pose[:3, 3] += self._displacement
+                displacement_m = float(np.linalg.norm(self._displacement))
+                self._max_displacement = max(self._max_displacement, displacement_m)
+                max_displacement_m = self._max_displacement
+            else:
+                pose[:3, 3] += imu_world_to_sim @ self._displacement
             self._last_pose = pose.copy()
             return ImuArmSnapshot(pose, self._status, self._last_received, self._samples,
                                   displacement_m, max_displacement_m, self._gesture_steps)

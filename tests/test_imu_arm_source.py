@@ -206,6 +206,126 @@ def test_rotating_glove_does_not_command_directional_stroke():
     assert source.snapshot(_anchor(), now=1.21).gesture_steps == 0
 
 
+def test_tilt_tracks_finger_direction_and_ignores_twist():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               tilt_gain=0.55, tilt_deadband=0.04,
+                               max_displacement=0.40)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    anchor = _anchor()
+    # Same end-effector orientation as the bent Vega home pose: fingers point +X.
+    anchor[:3, :3] = np.array([[0.0, 0.0, 1.0],
+                               [-1.0, 0.0, 0.0],
+                               [0.0, -1.0, 0.0]])
+    rest = source.snapshot(anchor, now=1.01)
+    np.testing.assert_allclose(rest.pose[:3, 3], anchor[:3, 3], atol=1e-8)
+
+    world_up_tip = Rotation.from_euler("y", -35, degrees=True).as_matrix()
+    tip = anchor[:3, :3].T @ world_up_tip @ anchor[:3, :3]
+    source.update(1_020_001, Rotation.from_matrix(tip).as_quat(),
+                  tip.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.02)
+    raised = source.snapshot(anchor, now=1.02)
+    delta = raised.pose[:3, 3] - anchor[:3, 3]
+    assert delta[2] > 0.15
+    assert abs(delta[1]) < 0.05
+    assert np.linalg.norm(delta) <= 0.40 + 1e-9
+
+    twist = anchor[:3, :3].T @ Rotation.from_euler("x", 40, degrees=True).as_matrix() @ anchor[:3, :3]
+    # Twist about the finger axis (+X in this home pose) must not translate.
+    source.update(1_030_001, Rotation.from_matrix(twist).as_quat(),
+                  twist.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.03)
+    twisted = source.snapshot(anchor, now=1.03)
+    np.testing.assert_allclose(twisted.pose[:3, 3], anchor[:3, 3], atol=1e-6)
+
+
+def test_tilt_mode_integrates_translation_without_a_pointing_change():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               max_speed=0.45, velocity_damping=2.6,
+                               max_displacement=0.45)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    for i in range(101, 161):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 12.5], [0, 0, 0],
+                      received_at=t / 1e6)
+    moved = source.snapshot(_anchor(), now=1.61)
+    assert moved.pose[2, 3] > _anchor()[2, 3] + 0.04
+    for i in range(161, 221):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    held = source.snapshot(_anchor(), now=2.21)
+    np.testing.assert_allclose(held.pose[:3, 3], moved.pose[:3, 3], atol=1e-6)
+
+
+def test_tilt_translation_leaks_back_when_the_palm_rests():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               max_speed=0.45, velocity_damping=2.6,
+                               max_displacement=0.45, translation_leak=1.6)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    for i in range(101, 161):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 12.5], [0, 0, 0],
+                      received_at=t / 1e6)
+    moved = source.snapshot(_anchor(), now=1.61)
+    assert moved.pose[2, 3] > _anchor()[2, 3] + 0.04
+    for i in range(161, 261):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    rested = source.snapshot(_anchor(), now=2.61)
+    assert rested.pose[2, 3] < moved.pose[2, 3] - 0.01
+    assert rested.pose[2, 3] > _anchor()[2, 3]
+
+
+def test_vertical_tilt_becomes_a_forward_reach():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               tilt_gain=0.55, tilt_deadband=0.04,
+                               max_displacement=0.40, vertical_to_forward=True)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    anchor = _anchor()
+    anchor[:3, :3] = np.array([[0.0, 0.0, 1.0],
+                               [-1.0, 0.0, 0.0],
+                               [0.0, -1.0, 0.0]])
+    up = anchor[:3, :3].T @ Rotation.from_euler("y", -35, degrees=True).as_matrix() @ anchor[:3, :3]
+    source.update(1_020_001, Rotation.from_matrix(up).as_quat(),
+                  up.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.02)
+    raised = source.snapshot(anchor, now=1.02)
+    delta = raised.pose[:3, 3] - anchor[:3, 3]
+    assert delta[0] > 0.15
+    assert abs(delta[2]) < delta[0]
+
+    down = anchor[:3, :3].T @ Rotation.from_euler("y", 35, degrees=True).as_matrix() @ anchor[:3, :3]
+    source.update(1_030_001, Rotation.from_matrix(down).as_quat(),
+                  down.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.03)
+    lowered = source.snapshot(anchor, now=1.03)
+    assert lowered.pose[0, 3] < anchor[0, 3] - 0.15
+
+
+def test_small_tilt_stays_inside_the_deadband():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               tilt_deadband=0.04)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    small = Rotation.from_euler("y", 2, degrees=True)
+    source.update(1_020_001, small.as_quat(), small.as_matrix().T @ [0, 0, 9.716],
+                  [0, 0, 0], received_at=1.02)
+    held = source.snapshot(_anchor(), now=1.02)
+    np.testing.assert_allclose(held.pose[:3, 3], _anchor()[:3, 3], atol=1e-8)
+
+
 def test_orientation_only_mode_never_integrates_translation():
     source = PalmImuRetargeter(motion_mode="orientation")
     for i in range(101):
@@ -257,3 +377,18 @@ class ImuArmSourceTests(unittest.TestCase):
 
     def test_orientation_only(self):
         test_orientation_only_mode_never_integrates_translation()
+
+    def test_tilt_tracking(self):
+        test_tilt_tracks_finger_direction_and_ignores_twist()
+
+    def test_vertical_tilt_reaches_forward(self):
+        test_vertical_tilt_becomes_a_forward_reach()
+
+    def test_tilt_deadband(self):
+        test_small_tilt_stays_inside_the_deadband()
+
+    def test_tilt_translation(self):
+        test_tilt_mode_integrates_translation_without_a_pointing_change()
+
+    def test_tilt_translation_leaks(self):
+        test_tilt_translation_leaks_back_when_the_palm_rests()

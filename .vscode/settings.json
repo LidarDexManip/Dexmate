@@ -1,3 +1,4 @@
 {
-    "ros.distro": "humble"
+    "ros.distro": "humble",
+    "cmake.sourceDirectory": "/home/isaac/Documents/Dexmate/mujoco-sim/wuji_hand_description"
 }

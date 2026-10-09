@@ -96,7 +96,7 @@ Open the articulated scene with synthetic wrist and finger motion:
 The fixed-arm scene welds Vega in place and moves only the 20 left hand joints.
 The articulated scene fixes Vega's base, head, lift, torso, and right arm,
 while seven left arm joints and 20 left hand joints move. Its neutral left arm
-starts bent, with the hand palm down. Converted URDF metadata/inertia warnings
+hangs with the elbow down beside the body and the hand out. Converted URDF metadata/inertia warnings
 may print during startup; the run should report **zero MuJoCo numerical
 warnings**.
 
@@ -171,6 +171,25 @@ during orientation calibration:
 You can pass a different discovered left glove serial as the first argument.
 Press **R** while still to recalibrate and anchor the current wrist angle.
 Pico is not needed for this glove-only wrist mode.
+
+### Whole-arm IK from the glove
+
+This launcher keeps the glove on the fingers and solves Vega's shoulder,
+elbow, and wrist together. The glove IMU does not measure position, so arm
+translation comes from how far the fingers tip away from the pose held during
+calibration. That swing is scaled into a wrist-position target, up to 40 cm,
+and damped least squares moves all seven joints to reach it. Twisting about
+the fingers aims the hand and does not translate the arm. Hold still for one
+second at startup. Press **R** while still to anchor again.
+
+```bash
+./scripts/launch_wuji_vega_glove_arm.sh
+```
+
+Tip the hand to move the arm, or draw it inward while keeping the fingers
+aimed the same way. Closer wrist targets fold the elbow; a straight elbow
+cannot reach those positions. Small tilts inside the deadband hold the arm
+still.
 
 ### Larger glove-only arm movement: directional strokes
 
