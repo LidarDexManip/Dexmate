@@ -31,6 +31,16 @@ def _rotation_from_xyzw(value):
     ])
 
 
+def _rotation_from_rotvec(rotvec):
+    """Rodrigues rotation matrix for an axis-angle vector."""
+    angle = float(np.linalg.norm(rotvec))
+    if angle < 1e-12:
+        return np.eye(3)
+    x, y, z = np.asarray(rotvec, dtype=np.float64) / angle
+    k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+    return np.eye(3) + math.sin(angle) * k + (1 - math.cos(angle)) * (k @ k)
+
+
 def _vector3(value, label):
     v = np.asarray(value, dtype=np.float64)
     if v.shape != (3,) or not np.isfinite(v).all():
@@ -65,7 +75,8 @@ class PalmImuRetargeter:
                  gesture_threshold=0.8, gesture_cooldown=0.45,
                  tilt_gain=0.50, tilt_deadband=0.05, tilt_smoothing=0.45,
                  translation_leak=0.0, translation_limit=None,
-                 pointing_axis=None, vertical_to_forward=False):
+                 pointing_axis=None, vertical_to_forward=False,
+                 tilt_pivot=None, arc_gain=1.0, max_arc_angle=2.4):
         self.calibration_seconds = float(calibration_seconds)
         self.stale_after = float(stale_after)
         self.max_speed = float(max_speed)
@@ -84,6 +95,9 @@ class PalmImuRetargeter:
         self.translation_limit = (None if translation_limit is None
                                   else float(translation_limit))
         self.vertical_to_forward = bool(vertical_to_forward)
+        self.arc_gain = float(arc_gain)
+        self.max_arc_angle = float(max_arc_angle)
+        self._tilt_pivot = None if tilt_pivot is None else _vector3(tilt_pivot, "tilt pivot")
         axis = np.array([0.0, 0.0, 1.0] if pointing_axis is None else pointing_axis,
                         dtype=np.float64)
         axis_norm = float(np.linalg.norm(axis))
@@ -106,6 +120,7 @@ class PalmImuRetargeter:
                 self.velocity_damping < 0 or self.tilt_gain <= 0 or
                 self.tilt_deadband < 0 or not 0 < self.tilt_smoothing <= 1 or
                 self.translation_leak < 0 or
+                not self.arc_gain > 0 or not self.max_arc_angle > 0 or
                 (self.translation_limit is not None and self.translation_limit <= 0) or
                 not np.isfinite(self.pointing_axis).all() or
                 not np.isclose(np.linalg.norm(self.pointing_axis), 1.0)):
@@ -126,6 +141,7 @@ class PalmImuRetargeter:
         self._velocity = np.zeros(3)
         self._displacement = np.zeros(3)
         self._translation = np.zeros(3)
+        self._arc_rotvec = np.zeros(3)
         self._gesture_goal = np.zeros(3)
         self._gesture_candidate_direction = None
         self._gesture_candidate_since_us = None
@@ -150,6 +166,18 @@ class PalmImuRetargeter:
             self._gesture_candidate_since_us = None
             self._gesture_armed = False
 
+    def set_tilt_pivot(self, pivot):
+        """Swing tilt targets around this sim-frame shoulder point.
+
+        With a pivot, tipping the fingers rotates the anchored hand about the
+        shoulder, so the target keeps its reach instead of sliding toward
+        the body. ``None`` restores straight-line tilt offsets.
+        """
+        pivot = None if pivot is None else _vector3(pivot, "tilt pivot")
+        with self._lock:
+            self._tilt_pivot = pivot
+            self._arc_rotvec[:] = 0
+
     def recenter(self, anchor_pose):
         """Restart stationary calibration and anchor at the current sim pose."""
         anchor = np.asarray(anchor_pose, dtype=np.float64)
@@ -172,6 +200,7 @@ class PalmImuRetargeter:
             self._velocity[:] = 0
             self._displacement[:] = 0
             self._translation[:] = 0
+            self._arc_rotvec[:] = 0
             self._gesture_goal[:] = 0
             self._gesture_candidate_direction = None
             self._gesture_candidate_since_us = None
@@ -373,6 +402,25 @@ class PalmImuRetargeter:
             offset *= self.max_displacement / magnitude
         return offset
 
+    def _tilt_arc(self, current_rotation, anchor_rotation):
+        """Axis-angle swing of the finger direction, scaled for the arm.
+
+        This is the shortest rotation from the calibrated finger direction to
+        the current one, so a twist about the fingers gives no swing.
+        """
+        neutral = anchor_rotation @ self.pointing_axis
+        current = current_rotation @ self.pointing_axis
+        cross = np.cross(neutral, current)
+        angle = math.atan2(float(np.linalg.norm(cross)), float(neutral @ current))
+        if angle <= self.tilt_deadband:
+            return np.zeros(3)
+        axis_norm = float(np.linalg.norm(cross))
+        if axis_norm < 1e-9:
+            # Fingers flipped straight back: no unique swing axis.
+            return self._arc_rotvec.copy()
+        angle = min(self.arc_gain * (angle - self.tilt_deadband), self.max_arc_angle)
+        return cross / axis_norm * angle
+
     def snapshot(self, anchor_pose, *, now=None):
         """Return anchored target pose; stale/invalid input returns no update."""
         now = time.monotonic() if now is None else float(now)
@@ -409,7 +457,22 @@ class PalmImuRetargeter:
             imu_world_to_sim = ref_sim_hand_R @ ref_wrist_R.T
             pose[:3, :3] = (imu_world_to_sim @ self._last_R @
                             self.imu_in_wrist_R.T @ self.hand_in_ee_R.T)
-            if self.motion_mode == "tilt":
+            if self.motion_mode == "tilt" and self._tilt_pivot is not None:
+                # Swing the anchored hand around the shoulder for lift, while
+                # retaining a radial tilt offset so forward/back motion can
+                # change reach and recruit the elbow.
+                goal = self._tilt_arc(pose[:3, :3], self._anchor[:3, :3])
+                self._arc_rotvec += self.tilt_smoothing * (goal - self._arc_rotvec)
+                arm = self._anchor[:3, 3] - self._tilt_pivot
+                tilt_offset = self._tilt_offset(
+                    pose[:3, :3], self._anchor[:3, :3])
+                self._displacement = (_rotation_from_rotvec(self._arc_rotvec) @ arm - arm
+                                      + tilt_offset + imu_world_to_sim @ self._translation)
+                pose[:3, 3] += self._displacement
+                displacement_m = float(np.linalg.norm(self._displacement))
+                self._max_displacement = max(self._max_displacement, displacement_m)
+                max_displacement_m = self._max_displacement
+            elif self.motion_mode == "tilt":
                 offset = self._tilt_offset(pose[:3, :3], self._anchor[:3, :3])
                 offset = offset + imu_world_to_sim @ self._translation
                 magnitude = float(np.linalg.norm(offset))
@@ -459,6 +522,9 @@ class PalmImuArmSource:
 
     def recenter(self, anchor_pose):
         self.estimator.recenter(anchor_pose)
+
+    def set_tilt_pivot(self, pivot):
+        self.estimator.set_tilt_pivot(pivot)
 
     def close(self):
         if not self._closed:

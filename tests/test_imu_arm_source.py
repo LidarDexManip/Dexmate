@@ -262,6 +262,28 @@ def test_tilt_mode_integrates_translation_without_a_pointing_change():
     np.testing.assert_allclose(held.pose[:3, 3], moved.pose[:3, 3], atol=1e-6)
 
 
+def test_pivot_tilt_changes_reach_for_elbow_control():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               tilt_gain=0.55, tilt_deadband=0.04,
+                               vertical_to_forward=True)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    anchor = _anchor()
+    source.set_tilt_pivot([0.0, -0.1, 0.3])
+    rest = source.snapshot(anchor, now=1.01)
+    current_rotation = Rotation.from_euler("y", -35, degrees=True).as_matrix()
+    source.update(1_010_001, Rotation.from_matrix(current_rotation).as_quat(),
+                  current_rotation.T @ [0, 0, 9.716], [0, 0, 0],
+                  received_at=1.01)
+    tilted = source.snapshot(anchor, now=1.01)
+    pivot = np.array([0.0, -0.1, 0.3])
+    rest_reach = np.linalg.norm(rest.pose[:3, 3] - pivot)
+    tilted_reach = np.linalg.norm(tilted.pose[:3, 3] - pivot)
+    assert tilted_reach < rest_reach - 0.005
+
+
 def test_tilt_translation_leaks_back_when_the_palm_rests():
     source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
                                max_speed=0.45, velocity_damping=2.6,
@@ -310,6 +332,41 @@ def test_vertical_tilt_becomes_a_forward_reach():
                   down.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.03)
     lowered = source.snapshot(anchor, now=1.03)
     assert lowered.pose[0, 3] < anchor[0, 3] - 0.15
+
+
+def test_tilt_with_pivot_swings_the_hand_around_the_shoulder():
+    source = PalmImuRetargeter(motion_mode="tilt", tilt_smoothing=1.0,
+                               tilt_deadband=0.04, max_displacement=0.40,
+                               arc_gain=1.2, vertical_to_forward=True)
+    pivot = np.array([0.0, -0.1, 1.2])
+    source.set_tilt_pivot(pivot)
+    for i in range(101):
+        t = i * 10_000
+        source.update(t + 1, [0, 0, 0, 1], [0, 0, 9.716], [0, 0, 0],
+                      received_at=t / 1e6)
+    anchor = _anchor()
+    # Fingers point +X, as in the Vega home pose.
+    anchor[:3, :3] = np.array([[0.0, 0.0, 1.0],
+                               [-1.0, 0.0, 0.0],
+                               [0.0, -1.0, 0.0]])
+    arm = anchor[:3, 3] - pivot
+    up = anchor[:3, :3].T @ Rotation.from_euler("y", -80, degrees=True).as_matrix() @ anchor[:3, :3]
+    source.update(1_020_001, Rotation.from_matrix(up).as_quat(),
+                  up.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.02)
+    raised = source.snapshot(anchor, now=1.02).pose[:3, 3]
+    # The shoulder arc carries the lift, while the forward/back component
+    # changes reach so the downstream IK can recruit the elbow.
+    assert abs(np.linalg.norm(raised - pivot) - np.linalg.norm(arm)) > 0.01
+    assert raised[2] > pivot[2] + 0.2
+    assert np.linalg.norm(raised - anchor[:3, 3]) > 0.40
+    swung = np.degrees(np.arccos((raised - pivot) @ arm / (arm @ arm)))
+    assert abs(swung - 1.2 * (80 - np.degrees(0.04))) < 2.0
+
+    twist = anchor[:3, :3].T @ Rotation.from_euler("x", 40, degrees=True).as_matrix() @ anchor[:3, :3]
+    source.update(1_030_001, Rotation.from_matrix(twist).as_quat(),
+                  twist.T @ [0, 0, 9.716], [0, 0, 0], received_at=1.03)
+    np.testing.assert_allclose(source.snapshot(anchor, now=1.03).pose[:3, 3],
+                               anchor[:3, 3], atol=1e-6)
 
 
 def test_small_tilt_stays_inside_the_deadband():
@@ -380,6 +437,9 @@ class ImuArmSourceTests(unittest.TestCase):
 
     def test_tilt_tracking(self):
         test_tilt_tracks_finger_direction_and_ignores_twist()
+
+    def test_tilt_arc_around_shoulder(self):
+        test_tilt_with_pivot_swings_the_hand_around_the_shoulder()
 
     def test_vertical_tilt_reaches_forward(self):
         test_vertical_tilt_becomes_a_forward_reach()
