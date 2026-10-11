@@ -6,6 +6,7 @@ Two teleoperation setups are documented here. Install and run the one you are us
 | --- | --- | --- |
 | [Pico on the physical Vega-1U](#1-pico-teleop-on-the-physical-vega-1u) | Both arms, from the Pico controllers | Laptop WebXR page, laptop leader, Jetson follower |
 | [Wuji glove in MuJoCo](#2-wuji-glove-teleop-in-mujoco) | Simulated Wuji Hand 2 fingers, plus a chosen wrist or arm mode | Laptop MuJoCo viewer |
+| [Glove + Pico headset quick start](#3-quick-start-glove-and-pico-headset-in-mujoco) | Pico hand tracking moves the simulated arm; the glove drives wrist and fingers | Laptop MuJoCo viewer + Pico browser |
 
 The Pico section drives the physical robot. The Wuji glove section drives a MuJoCo simulation on the laptop. An optional Pico wrist mode at the end of the glove section uses the headset only to rotate the simulated wrist while the glove still drives the fingers.
 
@@ -237,4 +238,74 @@ If the script picks the wrong address, pass the laptop Wi-Fi IP and the glove se
 ./scripts/launch_wuji_vega_pico_wrist.sh 192.168.1.65 WG1JA06260812032
 ```
 
-The default DexStream executable is `/home/isaac/miniconda3/envs/code_test/bin/dexstream`. Point `DEXSTREAM_BIN` at another executable when that path is different. This launcher starts the MuJoCo viewer only. The Jetson follower and `omni-paddle` leader from section 1 stay stopped.
+The launcher uses `.venv/bin/dexstream` (installed by `scripts/setup_sim.sh`), then `dexstream` on `PATH` or in a conda env; set `DEXSTREAM_BIN` to force one. This launcher starts the MuJoCo viewer only. The Jetson follower and `omni-paddle` leader from section 1 stay stopped.
+
+## 3. Quick start: glove and Pico headset in MuJoCo
+
+Simulation only; nothing here commands the physical robot. The full new-machine walkthrough is [NEW_MACHINE.md](NEW_MACHINE.md), every command is listed in [SIM_LAUNCH_COMMANDS.txt](SIM_LAUNCH_COMMANDS.txt), and every launcher appends what it ran to `SIM_RUN_LOG.txt`. AI assistants: see [AGENTS.md](AGENTS.md).
+
+### Install everything (once)
+
+```bash
+cd ~/Documents/Dexmate
+scripts/setup_sim.sh
+```
+
+This creates `.venv` and installs the pinned packages, DexStream and the Pico page's three.js into it. It then runs the tests and ends with `Setup complete`. It needs `git`, `curl`, and Python 3.10-3.12 with venv (3.11 tested).
+
+### Glove setup
+
+1. Connect the left glove: acquisition board -> supplied USB-C cable -> **powered** USB-C/Ethernet adapter -> laptop Ethernet.
+2. Configure the port and check the glove:
+
+   ```bash
+   bash scripts/configure_wuji_network.sh
+   .venv/bin/python -m wuji_teleop discover --seconds 3
+   ```
+
+   The glove is at `192.168.1.100` and the laptop gets `192.168.1.50`. The script uses a temporary profile and leaves the internet route alone. If Wi-Fi is also on `192.168.1.x`, it routes only the glove's address over Ethernet so the Pico stays on Wi-Fi.
+3. The launchers connect to the only glove found. With several gloves, pass the serial as the first argument or set `GLOVE_SN`.
+
+### Pico headset setup
+
+1. Put the Pico and the laptop on the same Wi-Fi.
+2. Start a Pico launcher (below). It finds the Wi-Fi address and DexStream itself and prints `https://<wifi-ip>:8091/`.
+3. Open that URL in the Pico browser (the main page, not `/preview`) and accept the certificate.
+4. Put both controllers down so the headset switches to hand tracking, then press **Enter AR**.
+
+### Which launcher to run
+
+| Launcher | What it does | Needs |
+| --- | --- | --- |
+| `scripts/launch_vega_joint_limits.sh` | Joint limit tool: slider and −/+ per left-arm joint inside `ARM_JOINT_LIMITS` (`wuji_teleop/vega_arm_sim.py`) | nothing |
+| `scripts/launch_wuji_vega_hand_only.sh` | Hand only: glove drives the fingers, arm fixed | glove |
+| `scripts/launch_wuji_vega_pico_hand.sh` | Hand + Pico: headset hand tracking moves the arm (joints 1-4), the glove turns the wrist (joints 5-7) and drives the fingers | glove + Pico |
+
+Close the MuJoCo window or press Ctrl-C to stop. Glove-only wrist and whole-arm modes are in [section 2](#run-the-glove).
+
+**Hand + Pico steps:**
+
+1. Run `scripts/launch_wuji_vega_pico_hand.sh`.
+2. Open the Pico page and enter AR with the controllers down.
+3. Hold the glove still for one second so the wrist calibrates.
+4. Wait for the status line to show `hand tracking`.
+5. Hold your hand in a comfortable working position and press **R** in the MuJoCo window.
+
+**Details:**
+
+- The arm holds when the headset loses your hand.
+- `PICO_SCALE=1.3 scripts/launch_wuji_vega_pico_hand.sh` makes the robot hand move 1.3 m per metre of yours.
+- Each run logs target, achieved and Pico XYZ plus all seven joints to `/tmp/vega-pico-hand-<time>.csv`.
+
+To restart the sim without dropping the Pico page:
+
+1. Run `scripts/launch_dexstream.sh` in one terminal and leave it running.
+2. Run `scripts/launch_wuji_vega_pico_hand.sh` in another. It detects DexStream and starts only the sim.
+
+| Symptom | Fix |
+| --- | --- |
+| `No wired interface with a link` | Glove adapter unpowered or cable out. |
+| Glove not found / `ping 192.168.1.100` fails | Rerun `bash scripts/configure_wuji_network.sh`. If the port has another profile active, `nmcli device disconnect <port>` first. |
+| Pico page does not load | DexStream is not running or the IP is wrong; run `scripts/launch_dexstream.sh` and use the URL it prints. |
+| Status stays `hand waiting` | The headset is not tracking your hand: enter AR, controllers down, hand in view. |
+| Arm is offset or rises too high | Hold your hand in your working position and press **R**. |

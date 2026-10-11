@@ -2,9 +2,14 @@
 set -euo pipefail
 
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  echo "Usage: $0 [J1 J2 J3 J4 J5 J6 J7]   (radians; opens a 60 s viewer with sliders)"
+  exit 0
+fi
 cd "$workspace"
-# shellcheck source=scripts/_log_run.sh
-source "$(dirname "${BASH_SOURCE[0]}")/_log_run.sh"
+# shellcheck source=scripts/_common.sh
+source "$workspace/scripts/_common.sh"
+require_venv
 log_run "$@"
 
 # Values are radians. Optional arguments override these defaults. A slider

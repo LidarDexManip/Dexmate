@@ -22,3 +22,4 @@ dexmate_vega1u_handoff/
 # Logs and local captures
 *.log
 *.jsonl
+SIM_RUN_LOG.txt

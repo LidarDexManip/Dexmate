@@ -4,37 +4,21 @@
 set -euo pipefail
 
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-wifi_interface="${WIFI_INTERFACE:-wlp4s0}"
-dexstream_bin="${DEXSTREAM_BIN:-/home/isaac/miniconda3/envs/code_test/bin/dexstream}"
-glove_serial="${2:-WG1JA06260812032}"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "Usage: $0 [WIFI_IP] [LEFT_GLOVE_SERIAL]"
-  echo "Defaults: current ${wifi_interface} IPv4 address; glove ${glove_serial}"
-  echo "Override executable with DEXSTREAM_BIN and Wi-Fi interface with WIFI_INTERFACE."
+  echo "Defaults: detected Wi-Fi address; the only glove found on the network."
+  echo "Env overrides: WIFI_INTERFACE, DEXSTREAM_BIN, GLOVE_SN."
   exit 0
 fi
 
-wifi_ip="${1:-}"
-if [[ -z "$wifi_ip" ]]; then
-  wifi_ip="$(ip -4 -o address show dev "$wifi_interface" | awk 'NR == 1 { split($4, address, "/"); print address[1] }')"
-fi
-if [[ -z "$wifi_ip" ]]; then
-  echo "No IPv4 address on ${wifi_interface}; pass the laptop Wi-Fi IP as the first argument." >&2
-  exit 1
-fi
-if [[ ! -x "$dexstream_bin" ]]; then
-  echo "DexStream executable not found: ${dexstream_bin}" >&2
-  exit 1
-fi
-if [[ ! -x "$workspace/.venv/bin/python" ]]; then
-  echo "Python environment missing: ${workspace}/.venv/bin/python" >&2
-  exit 1
-fi
-
 cd "$workspace"
-# shellcheck source=scripts/_log_run.sh
-source "$(dirname "${BASH_SOURCE[0]}")/_log_run.sh"
+# shellcheck source=scripts/_common.sh
+source "$workspace/scripts/_common.sh"
+require_venv
+wifi_ip="${1:-$(find_wifi_ip)}"
+dexstream_bin="$(find_dexstream)"
+set_glove_args "${2:-}"
 log_run "$@"
 
 echo "Starting DexStream on ${wifi_ip}:8090 and Pico page https://${wifi_ip}:8091/"
@@ -61,8 +45,7 @@ fi
 
 python_cmd=(
   "$workspace/.venv/bin/python" -m wuji_teleop.vega_arm_sim
-  --arm-input pico-wrist --finger-input glove
-  --glove-sn "$glove_serial"
+  --arm-input pico-wrist --finger-input glove "${glove_args[@]}"
   --report /tmp/vega-pico-wrist-live.json
 )
 log_cmd python "${python_cmd[@]}"
