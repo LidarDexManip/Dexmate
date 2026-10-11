@@ -18,6 +18,10 @@ if [[ ! -x "$workspace/.venv/bin/python" ]]; then
 fi
 
 cd "$workspace"
+# shellcheck source=scripts/_log_run.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_log_run.sh"
+log_run "$@"
+
 echo "Starting glove fingers + whole-arm IK in MuJoCo."
 echo "Hold the glove still for one second to calibrate."
 echo "Point the fingers up to raise the whole arm from the shoulder (straight up raises it overhead); point down to lower it."
@@ -25,7 +29,11 @@ echo "Tip side to side to sweep. The hand stays at full reach, so the elbow hold
 echo "Lower the hand to tuck the elbow first; the shoulder follows after the elbow starts bending."
 echo "Twist the forearm to roll the robot forearm. The arm follows slowly and returns with the calibrated pose."
 echo "Press R while still to recenter."
-exec "$workspace/.venv/bin/python" -m wuji_teleop.vega_arm_sim \
-  --arm-input glove-arm --finger-input glove \
-  --glove-sn "$glove_serial" \
+python_cmd=(
+  "$workspace/.venv/bin/python" -m wuji_teleop.vega_arm_sim
+  --arm-input glove-arm --finger-input glove
+  --glove-sn "$glove_serial"
   --report /tmp/vega-glove-arm-live.json
+)
+log_cmd python "${python_cmd[@]}"
+exec "${python_cmd[@]}"

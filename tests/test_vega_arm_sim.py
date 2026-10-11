@@ -21,10 +21,12 @@ from wuji_teleop.vega_arm_sim import (
     MujocoArm,
     SHOULDER_BODY_NAME,
     SyntheticWristPoseSource,
+    WristOrientationIK,
     desired_elbow_angle,
     desired_shoulder_pitch,
     glove_arm_ik,
     load_articulated_scene,
+    pico_upper_ik,
     shoulder_target_angle,
     run,
 )
@@ -62,6 +64,10 @@ def _rotation_about(axis, angle):
     x, y, z = np.asarray(axis, dtype=float) / np.linalg.norm(axis)
     k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
     return np.eye(3) + math.sin(angle) * k + (1 - math.cos(angle)) * (k @ k)
+
+
+def _rotation_angle(a, b):
+    return math.acos(float(np.clip((np.trace(a @ b.T) - 1.0) / 2.0, -1.0, 1.0)))
 
 
 class VegaArmSimulationTests(unittest.TestCase):
@@ -379,6 +385,61 @@ class VegaArmSimulationTests(unittest.TestCase):
         self.assertGreater(delta[4], 0.05)
         self.assertLess(delta[0], 0.04)
         self.assertEqual(report.mujoco_warnings, 0)
+
+    def _ee_pose(self, joints):
+        self.data.qpos[self.arm.qpos_ids] = joints
+        mujoco.mj_forward(self.model, self.data)
+        ee_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY_NAME)
+        return self.data.xpos[ee_id].copy(), self.data.xmat[ee_id].reshape(3, 3).copy()
+
+    def test_pico_upper_ik_tracks_position_with_the_first_four_joints(self):
+        self.arm.set_target(ARM_HOME_QPOS)
+        self.arm.initialize()
+        seed = self.data.qpos[self.arm.qpos_ids].copy()
+        home, rotation = self._ee_pose(seed)
+        pose = np.eye(4)
+        pose[:3, :3] = rotation
+        pose[:3, 3] = home + [0.15, 0.15, 0.15]
+        joints = pico_upper_ik(self.model, self.data, self.arm).solve(pose)
+        np.testing.assert_array_equal(joints[4:], seed[4:])
+        self.assertGreater(np.max(np.abs(joints[:4] - seed[:4])), 0.1)
+        self.assertTrue(np.all(joints >= self.arm.lower) and np.all(joints <= self.arm.upper))
+        position, _ = self._ee_pose(joints)
+        self.assertLess(np.linalg.norm(position - pose[:3, 3]), 0.03)
+
+    def test_wrist_ik_with_joint_indices_rotates_only_the_wrist_in_the_full_arm(self):
+        self.arm.set_target(ARM_HOME_QPOS)
+        self.arm.initialize()
+        seed = self.arm.target.copy()
+        _, start = self._ee_pose(seed)
+        target = _rotation_about([0, 0, 1], math.radians(30)) @ start
+        solver = WristOrientationIK(self.model, self.data, self.arm, joint_indices=(4, 5, 6))
+        joints = solver.solve(target)
+        np.testing.assert_array_equal(joints[:4], seed[:4])
+        self.assertTrue(np.all(joints >= self.arm.lower) and np.all(joints <= self.arm.upper))
+        _, achieved = self._ee_pose(joints)
+        self.assertLess(_rotation_angle(target, achieved), math.radians(5))
+        with self.assertRaises(ValueError):
+            WristOrientationIK(self.model, self.data, self.arm)
+
+    def test_wrist_ik_restores_orientation_after_upper_arm_moves(self):
+        self.arm.set_target(ARM_HOME_QPOS)
+        self.arm.initialize()
+        seed = self.arm.target.copy()
+        home, start = self._ee_pose(seed)
+        pose = np.eye(4)
+        pose[:3, :3] = start
+        pose[:3, 3] = home + [0.15, 0.15, 0.15]
+        upper = pico_upper_ik(self.model, self.data, self.arm).solve(pose, seed=seed)
+        self.assertGreater(abs(upper[0] - seed[0]), 0.1)
+        _, tipped = self._ee_pose(upper)
+        self.assertGreater(_rotation_angle(start, tipped), math.radians(5))
+        wrist = WristOrientationIK(self.model, self.data, self.arm, joint_indices=(4, 5, 6))
+        joints = wrist.solve(start, seed=upper)
+        np.testing.assert_array_equal(joints[:4], upper[:4])
+        position, achieved = self._ee_pose(joints)
+        self.assertLess(_rotation_angle(start, achieved), math.radians(5))
+        self.assertLess(np.linalg.norm(position - pose[:3, 3]), 0.05)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from .vega_hand_sim import HAND_XML, _resolve_hand_meshes, _vega_build_function
 from .retarget import TrackingController, WujiRetargeter
 from .simulation import MujocoHand, passive_viewer
 from .sources import GloveSource, SourceSnapshot, SyntheticSource
-from .vr_pose_source import PicoControllerPoseSource
+from .vr_pose_source import PicoControllerPoseSource, PicoHandPoseSource
 from .imu_arm_source import PalmImuArmSource
 
 
@@ -55,6 +55,12 @@ RIGHT_ARM_ACTUATOR_NAMES = tuple(f"{name}_sim_position" for name in RIGHT_ARM_JO
 RIGHT_ARM_HOME_QPOS = np.array([-1.20, 0.20, -0.30, -1.40, 0.0, 0.0, 0.0])
 PALM_IMU_ARM_INPUTS = ("glove-imu", "glove-gesture", "glove-wrist", "glove-arm")
 GESTURE_ARM_INPUTS = ("glove-gesture",)
+# Pico hand tracking places the arm; the glove palm IMU aims the wrist.
+PICO_HAND_ARM_INPUT = "pico-hand"
+IMU_ARM_INPUTS = PALM_IMU_ARM_INPUTS + (PICO_HAND_ARM_INPUT,)
+PICO_STALE_SECONDS = 0.250
+PICO_CSV_HEADER = ("t,target_x,target_y,target_z,ee_x,ee_y,ee_z,"
+                   "pico_x,pico_y,pico_z,j1,j2,j3,j4,j5,j6,j7")
 EE_BODY_NAME = "L_ee"
 SHOULDER_BODY_NAME = "L_arm_l2"
 ELBOW_BODY_NAME = "L_arm_l4"
@@ -350,8 +356,14 @@ class DampedLeastSquaresIK:
                  position_weight=1.0, orient_fade_distance=None,
                  distal_position_scale=1.0, wrist_pitch_scale=1.0,
                  shoulder_weight=0.0, roll_weight=0.0,
-                 height_flexion_gain=None):
+                 height_flexion_gain=None, active_joints=None):
         self.model, self.data, self.arm = model, data, arm
+        size = len(arm.qpos_ids)
+        active = range(size) if active_joints is None else active_joints
+        self.active = np.array(sorted({int(index) for index in active}), dtype=int)
+        if (len(self.active) == 0 or self.active[0] < 0 or self.active[-1] >= size or
+                len(self.active) != len(tuple(active))):
+            raise ValueError("active_joints must be unique arm joint indices")
         self.scratch = mujoco.MjData(model)
         self.body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY_NAME)
         self.shoulder_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, SHOULDER_BODY_NAME)
@@ -431,25 +443,42 @@ class DampedLeastSquaresIK:
         desired = shoulder + along * span_hat + (target_dir / target_norm) * pole_norm
         return desired - elbow
 
-    def solve(self, target_pose):
+    def solve(self, target_pose, seed=None):
+        """Return a full joint vector; joints outside ``active`` keep the seed.
+
+        ``seed`` defaults to the live arm joint positions.
+        """
         pose = np.asarray(target_pose, dtype=np.float64)
         if pose.shape != (4, 4) or not np.isfinite(pose).all():
             raise ValueError("Expected a finite 4x4 homogeneous wrist target")
         # IK runs in its own state so it cannot teleport the displayed arm.
         self.scratch.qpos[:] = self.data.qpos
         self.scratch.qvel[:] = self.data.qvel
-        q = self.scratch.qpos[self.arm.qpos_ids].copy()
+        if seed is None:
+            q = self.scratch.qpos[self.arm.qpos_ids].copy()
+        else:
+            q = np.asarray(seed, dtype=np.float64).copy()
+            if q.shape != self.arm.home.shape or not np.isfinite(q).all():
+                raise ValueError(f"Expected {len(self.arm.home)} finite seed joints")
         jacp = np.zeros((3, self.model.nv))
         jacr = np.zeros((3, self.model.nv))
         elbow_jacp = np.zeros((3, self.model.nv))
         dofs = self.arm.dof_ids
+        active = self.active
+        is_active = np.isin(np.arange(len(q)), active)
+        use_elbow = bool(is_active[ELBOW_JOINT_INDEX])
+        use_shoulder = self.shoulder_weight > 0 and bool(is_active[SHOULDER_PITCH_INDEX])
+        # The elbow body is carried only by the joints above the elbow.
+        use_elbow_down = bool(np.any(is_active[:ELBOW_JOINT_INDEX]))
+        roll_indices = [index for index in ROLL_JOINT_INDICES if is_active[index]]
+        use_roll = self.roll_weight > 0 and bool(roll_indices)
         elbow_row = np.zeros(7)
         elbow_row[ELBOW_JOINT_INDEX] = self.elbow_weight
         shoulder_row = np.zeros(7)
         shoulder_row[SHOULDER_PITCH_INDEX] = self.shoulder_weight
-        roll_rows = np.zeros((len(ROLL_JOINT_INDICES), 7))
-        roll_rows[range(len(ROLL_JOINT_INDICES)), ROLL_JOINT_INDICES] = self.roll_weight
-        roll_home = self.arm.home[list(ROLL_JOINT_INDICES)]
+        roll_rows = np.zeros((len(roll_indices), 7))
+        roll_rows[range(len(roll_indices)), roll_indices] = self.roll_weight
+        roll_home = self.arm.home[roll_indices]
         for _ in range(self.iterations):
             self.scratch.qpos[self.arm.qpos_ids] = q
             mujoco.mj_forward(self.model, self.scratch)
@@ -471,18 +500,19 @@ class DampedLeastSquaresIK:
                 # Follow the hand position first. Aim the wrist once it is close.
                 closeness = 1.0 - np.linalg.norm(pos_error) / self.orient_fade_distance
                 ori_weight *= float(np.clip(closeness, 0.2, 1.0))
-            error_parts = [
-                self.position_weight * pos_error,
-                ori_weight * self._rotation_error(pose[:3, :3], current_rot),
-                [self.elbow_weight * (elbow_goal - q[ELBOW_JOINT_INDEX])],
-                self.elbow_down_weight * down_error,
-            ]
-            if self.shoulder_weight > 0:
+            error_parts = [self.position_weight * pos_error]
+            if ori_weight > 0:
+                error_parts.append(
+                    ori_weight * self._rotation_error(pose[:3, :3], current_rot))
+            if use_elbow:
+                error_parts.append([self.elbow_weight * (elbow_goal - q[ELBOW_JOINT_INDEX])])
+            if use_elbow_down:
+                error_parts.append(self.elbow_down_weight * down_error)
+            if use_shoulder:
                 error_parts.append(
                     [self.shoulder_weight * (shoulder_goal - q[SHOULDER_PITCH_INDEX])])
-            if self.roll_weight > 0:
-                error_parts.append(
-                    self.roll_weight * (roll_home - q[list(ROLL_JOINT_INDICES)]))
+            if use_roll:
+                error_parts.append(self.roll_weight * (roll_home - q[roll_indices]))
             error = np.concatenate(error_parts)
             if np.linalg.norm(error) < 1e-4:
                 break
@@ -494,32 +524,36 @@ class DampedLeastSquaresIK:
             # bend belongs to the elbow.
             pos_jac[:, 4:] *= self.distal_position_scale
             ori_jac[:, WRIST_PITCH_INDEX] *= self.wrist_pitch_scale
-            jac_rows = [self.position_weight * pos_jac,
-                        ori_weight * ori_jac,
-                        elbow_row,
-                        self.elbow_down_weight * elbow_jacp[:, dofs]]
-            if self.shoulder_weight > 0:
+            jac_rows = [self.position_weight * pos_jac]
+            if ori_weight > 0:
+                jac_rows.append(ori_weight * ori_jac)
+            if use_elbow:
+                jac_rows.append(elbow_row)
+            if use_elbow_down:
+                jac_rows.append(self.elbow_down_weight * elbow_jacp[:, dofs])
+            if use_shoulder:
                 jac_rows.append(shoulder_row)
-            if self.roll_weight > 0:
+            if use_roll:
                 jac_rows.append(roll_rows)
-            jac = np.vstack(jac_rows)
+            jac = np.vstack(jac_rows)[:, active]
             # Damped least squares. Shoulder pitch carries the hand direction;
             # elbow flexion follows the shoulder-to-hand distance.
             task_size = len(error)
             inverse = np.linalg.solve(jac @ jac.T + self.damping**2 * np.eye(task_size),
                                       np.eye(task_size))
             pseudoinverse = jac.T @ inverse
-            null_projector = np.eye(7) - pseudoinverse @ jac
+            null_projector = np.eye(len(active)) - pseudoinverse @ jac
             posture = self.arm.home.copy()
             posture[ELBOW_JOINT_INDEX] = elbow_goal
             if self.shoulder_weight > 0:
                 posture[SHOULDER_PITCH_INDEX] = shoulder_goal
             delta = (pseudoinverse @ error + self.posture_gain *
-                     null_projector @ (posture - q))
+                     null_projector @ (posture - q)[active])
             magnitude = np.linalg.norm(delta)
             if magnitude > self.max_step:
                 delta *= self.max_step / magnitude
-            q = np.clip(q + delta, self.arm.lower, self.arm.upper)
+            q[active] = np.clip(q[active] + delta, self.arm.lower[active],
+                                self.arm.upper[active])
         return q
 
 
@@ -534,12 +568,34 @@ def glove_arm_ik(model, data, arm):
         shoulder_weight=1.6, roll_weight=0.30)
 
 
-class WristOrientationIK:
-    """Rotate only Vega's three distal wrist joints; proximal arm is welded."""
+def pico_upper_ik(model, data, arm):
+    """Position-only solver on joints 1-4; the wrist joints keep their seed.
 
-    def __init__(self, model, data, wrist: MujocoArm, *, damping=0.06,
-                 max_step=0.12, iterations=16):
-        if len(wrist.qpos_ids) != 3:
+    Four joints leave one spare degree of freedom for a 3D target, so the
+    shoulder, elbow, and roll goals stay light and only steer that swivel.
+    """
+    return DampedLeastSquaresIK(
+        model, data, arm, max_step=0.12, iterations=24,
+        orientation_weight=0.0, elbow_weight=0.25, elbow_down_weight=0.15,
+        position_weight=4.0, height_flexion_gain=ELBOW_LOWER_FLEXION_GAIN,
+        shoulder_weight=0.2, roll_weight=0.10, active_joints=(0, 1, 2, 3))
+
+
+class WristOrientationIK:
+    """Rotate only Vega's three distal wrist joints; the rest of the arm is held.
+
+    ``joint_indices`` picks the wrist joints within ``wrist``; by default all
+    of its joints, which suits the wrist-only scene. In the full arm scene pass
+    ``(4, 5, 6)``.
+    """
+
+    def __init__(self, model, data, wrist: MujocoArm, *, joint_indices=None,
+                 damping=0.06, max_step=0.12, iterations=16):
+        size = len(wrist.qpos_ids)
+        indices = range(size) if joint_indices is None else joint_indices
+        self.indices = np.array([int(index) for index in indices], dtype=int)
+        if (len(self.indices) != 3 or len(np.unique(self.indices)) != 3 or
+                np.any(self.indices < 0) or np.any(self.indices >= size)):
             raise ValueError("Wrist orientation IK needs exactly three wrist joints")
         self.model, self.data, self.wrist = model, data, wrist
         self.scratch = mujoco.MjData(model)
@@ -552,15 +608,25 @@ class WristOrientationIK:
         if self.body_id < 0 or self.damping <= 0 or self.max_step <= 0 or self.iterations < 1:
             raise ValueError("Invalid wrist orientation IK settings")
 
-    def solve(self, target_rotation):
+    def solve(self, target_rotation, seed=None):
+        """Return the arm's full joint vector with only the wrist joints changed.
+
+        ``seed`` defaults to the arm's current target.
+        """
         target = np.asarray(target_rotation, dtype=np.float64)
         if (target.shape != (3, 3) or not np.isfinite(target).all() or
                 not np.allclose(target.T @ target, np.eye(3), atol=2e-3) or
                 not np.isclose(np.linalg.det(target), 1.0, atol=2e-3)):
             raise ValueError("Expected a proper 3x3 wrist target rotation")
+        q = np.asarray(self.wrist.target if seed is None else seed,
+                       dtype=np.float64).copy()
+        if q.shape != self.wrist.home.shape or not np.isfinite(q).all():
+            raise ValueError(f"Expected {len(self.wrist.home)} finite seed joints")
         self.scratch.qpos[:] = self.data.qpos
         self.scratch.qvel[:] = self.data.qvel
-        q = self.wrist.target.copy()
+        indices = self.indices
+        dofs = self.wrist.dof_ids[indices]
+        lower, upper = self.wrist.lower[indices], self.wrist.upper[indices]
         for _ in range(self.iterations):
             self.scratch.qpos[self.wrist.qpos_ids] = q
             mujoco.mj_forward(self.model, self.scratch)
@@ -570,13 +636,13 @@ class WristOrientationIK:
                 break
             mujoco.mj_jacBody(self.model, self.scratch, self.jacp, self.jacr,
                               self.body_id)
-            jac = self.jacr[:, self.wrist.dof_ids]
+            jac = self.jacr[:, dofs]
             delta = jac.T @ np.linalg.solve(
                 jac @ jac.T + self.damping**2 * np.eye(3), error)
             magnitude = float(np.linalg.norm(delta))
             if magnitude > self.max_step:
                 delta *= self.max_step / magnitude
-            q = np.clip(q + delta, self.wrist.lower, self.wrist.upper)
+            q[indices] = np.clip(q[indices] + delta, lower, upper)
         return q
 
 
@@ -617,6 +683,50 @@ class SyntheticWristPoseSource:
         rot = rot @ self._axis_rotation([0, 0, 1], angles[2])
         pose[:3, :3] = self.origin[:3, :3] @ rot
         return pose
+
+
+class PicoHandArmMapper:
+    """Map Pico hand-tracking wrist position to an end-effector position target.
+
+    The first fresh frame after construction or :meth:`recenter` pairs the
+    tracked hand position with the current end-effector position. Stale,
+    missing, or invalid input yields no target so the arm holds; the pairing
+    survives dropouts.
+    """
+
+    def __init__(self, scale=1.0, stale_after=PICO_STALE_SECONDS):
+        self.scale = float(scale)
+        self.stale_after = float(stale_after)
+        if not math.isfinite(self.scale) or self.scale <= 0 or self.stale_after <= 0:
+            raise ValueError("Pico hand scale and stale timeout must be positive")
+        self.hand_origin = None
+        self.ee_reference = None
+        self.status = "waiting"
+        self.hand_position = None
+
+    def recenter(self):
+        self.hand_origin = self.ee_reference = None
+
+    def update(self, snapshot, ee_position, now):
+        """Return the target end-effector position, or None to hold the arm."""
+        frame = snapshot.frame
+        if snapshot.error:
+            self.status = "invalid"
+            return None
+        if frame is None:
+            self.status = "waiting"
+            return None
+        if now - frame.received_at > self.stale_after:
+            self.status = "holding"
+            return None
+        self.hand_position = np.asarray(frame.pose[:3, 3], dtype=np.float64).copy()
+        if self.hand_origin is None:
+            self.hand_origin = self.hand_position.copy()
+            self.ee_reference = np.asarray(ee_position, dtype=np.float64).copy()
+            self.status = "calibrated"
+        else:
+            self.status = "tracking"
+        return self.ee_reference + self.scale * (self.hand_position - self.hand_origin)
 
 
 def load_articulated_scene(*, wrist_only=False):
@@ -662,6 +772,7 @@ class ArmHandRunReport:
     arm_gesture_steps: int = 0
     arm_joint_peak_delta_rad: list[float] | None = None
     mujoco_warnings: int = 0
+    pico_hand: dict | None = None
 
 
 class ManualJointSliderPanel:
@@ -703,7 +814,8 @@ class ManualJointSliderPanel:
 
 def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
     arm_imu_source=None, manual_joints=None,
-        duration=None, headless=False, report_path=None):
+        duration=None, headless=False, report_path=None,
+        pico_scale=1.0, log_csv=None):
     """Run the arm and glove-finger loops together in the articulated scene.
 
     MuJoCo physics advances at the model's 500 Hz timestep.  Hand tracking is
@@ -715,6 +827,9 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
     position that swings around the shoulder as the fingers tip away from
     calibration.
     ``glove-wrist`` solves only the three wrist joints.
+    ``pico-hand`` places the hand with joints 1-4 from Pico hand tracking,
+    scaled by ``pico_scale``, and aims joints 5-7 from the palm IMU. Each
+    solved target is appended to ``log_csv`` when given.
     """
     wrist_only = arm_input in ("pico-wrist", "glove-wrist")
     if arm_input == "manual":
@@ -733,12 +848,14 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
         set_pivot = getattr(arm_imu_source, "set_tilt_pivot", None)
         if set_pivot is not None:
             set_pivot(ik.arc_pivot)
+    elif arm_input == PICO_HAND_ARM_INPUT:
+        ik = pico_upper_ik(model, data, arm)
     else:
         ik = DampedLeastSquaresIK(model, data, arm)
     # The solver may jump to a distant pose in one tick. The arm command
     # approaches that pose at a limited joint rate so the motion stays steerable.
     joint_slew = arm.home.copy()
-    max_joint_rate = 1.15 if arm_input == "glove-arm" else None
+    max_joint_rate = {"glove-arm": 1.15, PICO_HAND_ARM_INPUT: 1.5}.get(arm_input)
     slider_panel = ManualJointSliderPanel(manual_joints) if arm_input == "manual" else None
     manual_selected = ELBOW_JOINT_INDEX
 
@@ -748,7 +865,7 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
             return
         step = max_joint_rate * arm_period
         elbow_error = goal[ELBOW_JOINT_INDEX] - joint_slew[ELBOW_JOINT_INDEX]
-        if elbow_error < -0.03:
+        if arm_input == "glove-arm" and elbow_error < -0.03:
             # Tuck the elbow before pitching the shoulder so lowering the hand
             # visibly starts at the elbow instead of looking shoulder-led.
             elbow_step = min(2.0 * step, 0.08)
@@ -768,16 +885,31 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
             joint_slew + np.clip(goal - joint_slew, -step, step),
             arm.lower, arm.upper)
         arm.set_target(joint_slew)
-    wrist_ik = WristOrientationIK(model, data, arm) if wrist_only else None
+    if wrist_only:
+        wrist_ik = WristOrientationIK(model, data, arm)
+    elif arm_input == PICO_HAND_ARM_INPUT:
+        wrist_ik = WristOrientationIK(model, data, arm, joint_indices=(4, 5, 6))
+    else:
+        wrist_ik = None
     ee = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY_NAME)
     origin = np.eye(4)
     origin[:3, :3] = data.xmat[ee].reshape(3, 3)
     origin[:3, 3] = data.xpos[ee]
     wrist_source = SyntheticWristPoseSource(origin) if arm_input == "synthetic" else None
-    if arm_input in ("pico-controller", "pico-wrist") and pose_source is None:
+    if arm_input in ("pico-controller", "pico-wrist", PICO_HAND_ARM_INPUT) and pose_source is None:
         raise ValueError(f"{arm_input} arm input requires a pose source")
-    if arm_input in PALM_IMU_ARM_INPUTS and arm_imu_source is None:
+    if arm_input in IMU_ARM_INPUTS and arm_imu_source is None:
         raise ValueError(f"{arm_input} arm input requires a palm IMU source")
+    pico_mapper = (PicoHandArmMapper(pico_scale) if arm_input == PICO_HAND_ARM_INPUT
+                   else None)
+    pico_target = pico_ik_error = None
+    pico_rows = 0
+    csv_file = None
+    if pico_mapper is not None and log_csv:
+        Path(log_csv).parent.mkdir(parents=True, exist_ok=True)
+        csv_file = open(log_csv, "w", encoding="utf-8")
+        csv_file.write(PICO_CSV_HEADER + "\n")
+        print(f"Logging pico-hand targets to {log_csv}", flush=True)
     keys = queue.SimpleQueue()
     context = nullcontext(None) if headless else passive_viewer(model, data, keys.put)
     report = ArmHandRunReport(finger_input)
@@ -828,7 +960,7 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                         manual_joints[manual_selected] += 0.10
                     elif arm_input == "manual" and key in (ord("r"), ord("R")):
                         manual_joints[:] = arm.home
-                    elif key in (ord("r"), ord("R")) and arm_input in PALM_IMU_ARM_INPUTS:
+                    elif key in (ord("r"), ord("R")) and arm_input in IMU_ARM_INPUTS:
                         recenter_requested = True
                 now = time.monotonic()
                 guard = viewer.lock() if viewer else nullcontext()
@@ -842,6 +974,8 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                         joint_slew[:] = data.qpos[arm.qpos_ids]
                         arm.set_target(joint_slew)
                         arm_status = "calibrating"
+                        if pico_mapper is not None:
+                            pico_mapper.recenter()
                         recenter_requested = False
                     if now >= next_finger:
                         snapshot = source.read()
@@ -862,6 +996,42 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                             command_arm(ik.solve(wrist_source.read(now - started)))
                             arm_status = "synthetic"
                             report.arm_ik_updates += 1
+                        elif pico_mapper is not None:
+                            scratch = ik.scratch
+                            if pico_mapper.hand_origin is None:
+                                # Reference the commanded pose, not the servo's
+                                # gravity sag, so calibration does not drop the arm.
+                                scratch.qpos[:] = data.qpos
+                                scratch.qpos[arm.qpos_ids] = arm.target
+                                mujoco.mj_kinematics(model, scratch)
+                            target_position = pico_mapper.update(
+                                pose_source.read(), scratch.xpos[ee], now)
+                            arm_status = f"hand {pico_mapper.status}"
+                            imu_snapshot = arm_imu_source.read(origin, now=now)
+                            wrist_rotation = (None if imu_snapshot.pose is None
+                                              else imu_snapshot.pose[:3, :3])
+                            if target_position is None and wrist_rotation is not None:
+                                # The glove keeps the wrist while hand tracking drops out.
+                                command_arm(wrist_ik.solve(wrist_rotation, seed=arm.target))
+                            if target_position is not None:
+                                target_pose = np.eye(4)
+                                target_pose[:3, :3] = data.xmat[ee].reshape(3, 3)
+                                target_pose[:3, 3] = target_position
+                                goal = ik.solve(target_pose, seed=arm.target)
+                                if wrist_rotation is not None:
+                                    goal = wrist_ik.solve(wrist_rotation, seed=goal)
+                                command_arm(goal)
+                                scratch.qpos[arm.qpos_ids] = goal
+                                mujoco.mj_kinematics(model, scratch)
+                                pico_target = target_position
+                                pico_ik_error = float(np.linalg.norm(
+                                    target_position - scratch.xpos[ee]))
+                                report.arm_ik_updates += 1
+                                if csv_file is not None:
+                                    values = (now - started, *target_position, *data.xpos[ee],
+                                              *pico_mapper.hand_position, *goal)
+                                    csv_file.write(",".join(f"{v:.6f}" for v in values) + "\n")
+                                    pico_rows += 1
                         elif arm_input in PALM_IMU_ARM_INPUTS:
                             imu_snapshot = arm_imu_source.read(origin, now=now)
                             arm_status = imu_snapshot.status
@@ -984,6 +1154,12 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                     elif arm_input in GESTURE_ARM_INPUTS:
                         status_line += (f" | strokes {report.arm_gesture_steps}"
                                         f" | arm command Δp {report.arm_gesture_command_m:.3f} m")
+                    elif pico_mapper is not None and pico_target is not None:
+                        status_line += (f" | target xyz=({pico_target[0]:+.3f},"
+                                        f"{pico_target[1]:+.3f},{pico_target[2]:+.3f})"
+                                        f" | IK err {pico_ik_error * 100:.1f} cm")
+                    if csv_file is not None:
+                        csv_file.flush()
                     print(status_line + (f" | {finger_controller.detail}"
                                          if finger_controller.detail else ""), flush=True)
                     last_received, last_fingers = snapshot.received, finger_controller.updates
@@ -1001,6 +1177,22 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                 if sleep_for > 0:
                     time.sleep(sleep_for)
     finally:
+        if csv_file is not None:
+            csv_file.close()
+        if pico_mapper is not None:
+            report.pico_hand = {
+                "scale": pico_mapper.scale,
+                "log_csv": str(log_csv) if log_csv else None,
+                "rows_written": pico_rows,
+                "status": pico_mapper.status,
+                "hand_origin": (None if pico_mapper.hand_origin is None
+                                else pico_mapper.hand_origin.tolist()),
+                "ee_reference": (None if pico_mapper.ee_reference is None
+                                 else pico_mapper.ee_reference.tolist()),
+                "last_target": None if pico_target is None else pico_target.tolist(),
+                "last_ee": data.xpos[ee].tolist(),
+                "last_ik_error_m": pico_ik_error,
+            }
         report.elapsed_seconds = time.monotonic() - started
         report.simulation_seconds = float(data.time)
         report.arm_joint_peak_delta_rad = arm_peak_delta.tolist()
@@ -1025,7 +1217,7 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
 def main(argv=None):
     import argparse
 
-    def positive_seconds(value):
+    def positive_number(value):
         number = float(value)
         if not math.isfinite(number) or number <= 0:
             raise argparse.ArgumentTypeError("must be a finite number greater than zero")
@@ -1033,14 +1225,18 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--finger-input", choices=("glove", "synthetic"), default="synthetic")
-    parser.add_argument("--arm-input", choices=("manual", "synthetic", "pico-controller", "pico-wrist", "glove-imu", "glove-gesture", "glove-wrist", "glove-arm"), default="synthetic")
+    parser.add_argument("--arm-input", choices=("manual", "synthetic", "pico-controller", "pico-wrist", "pico-hand", "glove-imu", "glove-gesture", "glove-wrist", "glove-arm"), default="synthetic")
     parser.add_argument("--joints", nargs=7, type=float, metavar=("J1", "J2", "J3", "J4", "J5", "J6", "J7"),
                         help="manual arm targets in radians: shoulder...wrist")
     parser.add_argument("--glove-sn")
     parser.add_argument("--user-id", default="")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--duration", type=positive_seconds)
+    parser.add_argument("--duration", type=positive_number)
     parser.add_argument("--report")
+    parser.add_argument("--pico-scale", type=positive_number,
+                        help="pico-hand: robot metres per tracked hand metre (default 1.0)")
+    parser.add_argument("--log-csv", metavar="PATH",
+                        help="pico-hand: per-update target log (default /tmp/vega-pico-hand-<time>.csv)")
     args = parser.parse_args(argv)
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")
@@ -1050,8 +1246,12 @@ def main(argv=None):
         parser.error("--arm-input manual requires --joints J1 J2 J3 J4 J5 J6 J7")
     if args.arm_input != "manual" and args.joints is not None:
         parser.error("--joints applies only to --arm-input manual")
-    if args.arm_input in PALM_IMU_ARM_INPUTS and args.finger_input != "glove":
+    if args.arm_input in IMU_ARM_INPUTS and args.finger_input != "glove":
         parser.error(f"--arm-input {args.arm_input} requires --finger-input glove so both use one glove connection")
+    if args.arm_input != PICO_HAND_ARM_INPUT and (args.pico_scale is not None or args.log_csv):
+        parser.error("--pico-scale and --log-csv apply only to --arm-input pico-hand")
+    if args.arm_input == PICO_HAND_ARM_INPUT and not args.log_csv:
+        args.log_csv = f"/tmp/vega-pico-hand-{time.strftime('%Y%m%d-%H%M%S')}.csv"
     try:
         if args.finger_input == "glove":
             import wuji_sdk
@@ -1064,11 +1264,13 @@ def main(argv=None):
         try:
             if args.arm_input in ("pico-controller", "pico-wrist"):
                 pose_source = PicoControllerPoseSource()
-            elif args.arm_input in PALM_IMU_ARM_INPUTS:
+            elif args.arm_input == PICO_HAND_ARM_INPUT:
+                pose_source = PicoHandPoseSource()
+            if args.arm_input in IMU_ARM_INPUTS:
                 from .imu_arm_source import PalmImuRetargeter
                 mount_rotation = source.palm_imu_mount_rotation()
                 gesture = args.arm_input == "glove-gesture"
-                wrist = args.arm_input == "glove-wrist"
+                wrist = args.arm_input in ("glove-wrist", PICO_HAND_ARM_INPUT)
                 whole_arm = args.arm_input == "glove-arm"
                 arm_imu_source = PalmImuArmSource(
                     source.palm_imu_resource(),
@@ -1102,7 +1304,8 @@ def main(argv=None):
             run(source, finger_input=args.finger_input, arm_input=args.arm_input,
                 pose_source=pose_source, arm_imu_source=arm_imu_source,
                 manual_joints=args.joints, duration=args.duration,
-                headless=args.headless, report_path=args.report)
+                headless=args.headless, report_path=args.report,
+                pico_scale=args.pico_scale or 1.0, log_csv=args.log_csv)
         finally:
             for closeable in (arm_imu_source, source, pose_source):
                 if closeable is None:

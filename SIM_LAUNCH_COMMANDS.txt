@@ -1,0 +1,87 @@
+# Vega-1U + Wuji Hand 2 — simulation launch commands
+# Workspace: /home/isaac/Documents/Dexmate
+# Python:    .venv/bin/python
+#
+# Each scripts/launch_wuji_vega_*.sh appends what it ran to SIM_RUN_LOG.txt
+# (tail SIM_RUN_LOG.txt).
+#
+# When we start a sim from the assistant, the exact command line should match
+# an entry here (or be added here first). Reports default under /tmp/.
+
+# --- Prerequisites (one-time) ---
+# Glove on Ethernet (typical): laptop enp3s0 192.168.1.50, glove 192.168.1.100
+# Pico (when ready): same Wi-Fi as laptop; DexStream HTTPS page on port 8091
+# Optional VR sim deps:
+#   .venv/bin/python -m pip install -r requirements-wuji-vr-sim.txt
+
+# --- Glove only: whole arm from palm IMU tilt (no Pico) ---
+scripts/launch_wuji_vega_glove_arm.sh
+# Same with explicit serial:
+scripts/launch_wuji_vega_glove_arm.sh WG1JA06260812032
+# Under the hood:
+#   .venv/bin/python -m wuji_teleop.vega_arm_sim \
+#     --arm-input glove-arm --finger-input glove \
+#     --glove-sn WG1JA06260812032 \
+#     --report /tmp/vega-glove-arm-live.json
+
+# --- Glove: wrist joints only from palm IMU (shoulder/elbow fixed) ---
+scripts/launch_wuji_vega_glove_wrist.sh
+
+# --- Manual joint jog (no glove): Tk sliders + MuJoCo viewer ---
+.venv/bin/python -m wuji_teleop.vega_arm_range
+
+# --- Manual arm pose from CLI (no viewer interaction) ---
+scripts/launch_wuji_vega_manual_arm.sh
+
+# --- Pico: wrist only + Wuji fingers (shoulder/elbow welded) ---
+# Starts DexStream, then sim. Set DEXSTREAM_BIN if not using code_test conda.
+scripts/launch_wuji_vega_pico_wrist.sh
+# With explicit Wi-Fi IP and glove serial:
+scripts/launch_wuji_vega_pico_wrist.sh <WIFI_IP> WG1JA06260812032
+
+# --- Pico: legacy full 7-DOF arm from controller (all joints; no split with glove wrist) ---
+# Prefer the planned pico-upper + glove-wrist mode instead (see plan below).
+.venv/bin/python -m wuji_teleop.vega_arm_sim \
+  --arm-input pico-controller --finger-input glove \
+  --glove-sn WG1JA06260812032 \
+  --report /tmp/vega-pico-controller-live.json
+# Requires DexStream running separately (see launch_wuji_vega_pico_wrist.sh).
+
+# --- Headless smoke test (no window) ---
+.venv/bin/python -m wuji_teleop.vega_arm_sim \
+  --arm-input glove-arm --finger-input glove \
+  --glove-sn WG1JA06260812032 \
+  --headless --duration 10 --report /tmp/vega-arm-check.json
+
+# --- Unit tests ---
+.venv/bin/python -m unittest tests.test_vega_arm_sim tests.test_vega_pico_wrist tests.test_imu_arm_source
+
+# --- Stop a running sim (kill only the vega_arm_sim process) ---
+# ps -eo pid,cmd | awk '/python -m wuji_teleop.vega_arm/ && !/awk/'
+
+# --- Pico hand tracking (arm) + Wuji glove (wrist and fingers) ---
+# Starts DexStream with hand input (no world-frame snap), then sim.
+# DexStream must use: --input hand --disable-world-frame-snap (see launcher).
+scripts/launch_wuji_vega_pico_hand.sh
+# With explicit Wi-Fi IP and glove serial:
+scripts/launch_wuji_vega_pico_hand.sh 10.90.198.129 WG1JA06260812032
+# Optional arm scale from Pico hand position:
+PICO_SCALE=1.0 scripts/launch_wuji_vega_pico_hand.sh
+# Under the hood (DexStream running separately with --input hand --disable-world-frame-snap):
+#   .venv/bin/python -m wuji_teleop.vega_arm_sim \
+#     --arm-input pico-hand --finger-input glove \
+#     --glove-sn WG1JA06260812032 \
+#     --report /tmp/vega-pico-hand-live.json \
+#     [--pico-scale 1.0] [--log-csv PATH]
+#
+# Two-terminal setup: the launcher stops DexStream (and the Pico page on 8091)
+# whenever the sim exits. To keep the Pico page up while restarting the sim:
+# Terminal 1 (leave running):
+env -u ZENOH_CONFIG -u ROBOT_NAME /home/isaac/miniconda3/envs/code_test/bin/dexstream \
+  --host 192.168.1.65 --port 8090 --mode wireless --input hand \
+  --disable-world-frame-snap --no-shm
+# Terminal 2 (restart as often as needed):
+.venv/bin/python -m wuji_teleop.vega_arm_sim \
+  --arm-input pico-hand --finger-input glove \
+  --glove-sn WG1JA06260812032 \
+  --report /tmp/vega-pico-hand-live.json

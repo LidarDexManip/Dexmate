@@ -33,11 +33,17 @@ if [[ ! -x "$workspace/.venv/bin/python" ]]; then
 fi
 
 cd "$workspace"
+# shellcheck source=scripts/_log_run.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_log_run.sh"
+log_run "$@"
+
 echo "Starting DexStream on ${wifi_ip}:8090 and Pico page https://${wifi_ip}:8091/"
 echo "On the Pico, open the page, accept its certificate, and enter the VR session."
 echo "Hold the LEFT index trigger and rotate the controller to move only the simulated wrist."
-env -u ZENOH_CONFIG -u ROBOT_NAME "$dexstream_bin" \
-  --host "$wifi_ip" --port 8090 --mode wireless --input paddle --no-shm &
+dexstream_cmd=(env -u ZENOH_CONFIG -u ROBOT_NAME "$dexstream_bin"
+  --host "$wifi_ip" --port 8090 --mode wireless --input paddle --no-shm)
+log_cmd dexstream "${dexstream_cmd[@]}"
+"${dexstream_cmd[@]}" &
 dexstream_pid=$!
 
 cleanup() {
@@ -53,7 +59,11 @@ if ! kill -0 "$dexstream_pid" 2>/dev/null; then
   exit 1
 fi
 
-"$workspace/.venv/bin/python" -m wuji_teleop.vega_arm_sim \
-  --arm-input pico-wrist --finger-input glove \
-  --glove-sn "$glove_serial" \
+python_cmd=(
+  "$workspace/.venv/bin/python" -m wuji_teleop.vega_arm_sim
+  --arm-input pico-wrist --finger-input glove
+  --glove-sn "$glove_serial"
   --report /tmp/vega-pico-wrist-live.json
+)
+log_cmd python "${python_cmd[@]}"
+"${python_cmd[@]}"

@@ -228,6 +228,19 @@ hand translation:
 The glove's fused IMU supplies wrist orientation. The program reads the SDK's
 fixed IMU-to-wrist transform so the sensor axes map to the simulated hand.
 
+### Pico hand tracking for the arm
+
+Pico hand position drives shoulder and elbow (j1–j4); the Wuji glove drives wrist
+(j5–j7) and fingers. DexStream must run with `--input hand --disable-world-frame-snap`.
+Start everything with `./scripts/launch_wuji_vega_pico_hand.sh` (optional
+`PICO_SCALE` env for `--pico-scale`). On the Pico, open `https://<WIFI_IP>:8091/`,
+accept the certificate, enter VR **without controllers** (hand tracking on). Hold
+the gloved left hand in view, stay still, then press **R** in the sim to recenter.
+If hand tracking is lost, the arm holds its last pose. The sim prints an XYZ log CSV
+(default `/tmp/vega-pico-hand-<time>.csv`) with columns: `t`, `target_x/y/z`,
+`ee_x/y/z`, `pico_x/y/z`, `j1`…`j7`. Wearing the glove can reduce Pico hand-tracking
+quality; keep the hand visible to the headset.
+
 ### Pico controller for wrist only
 
 The Pico wrist-only scene welds Vega's shoulder and elbow at their zero pose. Only
