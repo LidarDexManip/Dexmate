@@ -51,8 +51,19 @@ ARM_JOINT_LIMITS = np.array([
 ARM_HOME_QPOS = np.array([1.39, 0.06, 0.14, -1.38, 0.0, 0.0, 0.0])
 RIGHT_ARM_JOINT_NAMES = tuple(f"R_arm_j{i}" for i in range(1, 8))
 RIGHT_ARM_ACTUATOR_NAMES = tuple(f"{name}_sim_position" for name in RIGHT_ARM_JOINT_NAMES)
-# Mirror of the left home: elbow down, hand in front rather than out to the side.
+# The URDF mirrors several right-arm joint axes.  Reflecting a left pose across
+# the robot's x-z plane therefore negates every joint except elbow flexion j4.
+RIGHT_ARM_JOINT_SIGNS = np.array([-1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0])
+# Keep the legacy parked pose for left-only scenes. Bilateral mode uses the
+# exact mirror so both active arms start from equivalent kinematics.
 RIGHT_ARM_HOME_QPOS = np.array([-1.20, 0.20, -0.30, -1.40, 0.0, 0.0, 0.0])
+RIGHT_ARM_BIMANUAL_HOME_QPOS = RIGHT_ARM_JOINT_SIGNS * ARM_HOME_QPOS
+RIGHT_ARM_JOINT_LIMITS = np.column_stack((
+    np.minimum(RIGHT_ARM_JOINT_SIGNS * ARM_JOINT_LIMITS[:, 0],
+               RIGHT_ARM_JOINT_SIGNS * ARM_JOINT_LIMITS[:, 1]),
+    np.maximum(RIGHT_ARM_JOINT_SIGNS * ARM_JOINT_LIMITS[:, 0],
+               RIGHT_ARM_JOINT_SIGNS * ARM_JOINT_LIMITS[:, 1]),
+))
 PALM_IMU_ARM_INPUTS = ("glove-imu", "glove-gesture", "glove-wrist", "glove-arm")
 GESTURE_ARM_INPUTS = ("glove-gesture",)
 # Pico hand tracking places the arm; the glove palm IMU aims the wrist.
@@ -60,7 +71,8 @@ PICO_HAND_ARM_INPUT = "pico-hand"
 IMU_ARM_INPUTS = PALM_IMU_ARM_INPUTS + (PICO_HAND_ARM_INPUT,)
 PICO_STALE_SECONDS = 0.250
 PICO_CSV_HEADER = ("t,target_x,target_y,target_z,ee_x,ee_y,ee_z,"
-                   "pico_x,pico_y,pico_z,j1,j2,j3,j4,j5,j6,j7")
+                   "pico_x,pico_y,pico_z,filtered_x,filtered_y,filtered_z,"
+                   "workspace_clipped,j1,j2,j3,j4,j5,j6,j7")
 EE_BODY_NAME = "L_ee"
 SHOULDER_BODY_NAME = "L_arm_l2"
 ELBOW_BODY_NAME = "L_arm_l4"
@@ -356,7 +368,12 @@ class DampedLeastSquaresIK:
                  position_weight=1.0, orient_fade_distance=None,
                  distal_position_scale=1.0, wrist_pitch_scale=1.0,
                  shoulder_weight=0.0, roll_weight=0.0,
-                 height_flexion_gain=None, active_joints=None):
+                 height_flexion_gain=None, active_joints=None,
+                 max_total_step=None, elbow_pole_direction=(0.0, 0.0, -1.0),
+                 ee_body_name=EE_BODY_NAME,
+                 shoulder_body_name=SHOULDER_BODY_NAME,
+                 elbow_body_name=ELBOW_BODY_NAME,
+                 shoulder_pitch_joint_name=SHOULDER_PITCH_JOINT_NAME):
         self.model, self.data, self.arm = model, data, arm
         size = len(arm.qpos_ids)
         active = range(size) if active_joints is None else active_joints
@@ -365,13 +382,16 @@ class DampedLeastSquaresIK:
                 len(self.active) != len(tuple(active))):
             raise ValueError("active_joints must be unique arm joint indices")
         self.scratch = mujoco.MjData(model)
-        self.body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY_NAME)
-        self.shoulder_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, SHOULDER_BODY_NAME)
-        self.elbow_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, ELBOW_BODY_NAME)
+        self.body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, ee_body_name)
+        self.shoulder_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, shoulder_body_name)
+        self.elbow_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, elbow_body_name)
         if self.body_id < 0 or self.shoulder_id < 0 or self.elbow_id < 0:
             raise ValueError("End-effector, shoulder, or elbow body is missing")
         self.damping = float(damping)
         self.max_step = float(max_step)
+        self.max_total_step = (None if max_total_step is None
+                               else float(max_total_step))
         self.iterations = int(iterations)
         self.orientation_weight = float(orientation_weight)
         self.posture_gain = float(posture_gain)
@@ -386,17 +406,26 @@ class DampedLeastSquaresIK:
         self.roll_weight = float(roll_weight)
         self.height_flexion_gain = (None if height_flexion_gain is None
                         else float(height_flexion_gain))
+        self.elbow_pole_direction = np.asarray(
+            elbow_pole_direction, dtype=np.float64)
+        pole_norm = float(np.linalg.norm(self.elbow_pole_direction))
+        if pole_norm > 0:
+            self.elbow_pole_direction /= pole_norm
         if (self.damping <= 0 or self.max_step <= 0 or self.iterations < 1 or
                 self.posture_gain < 0 or self.elbow_weight < 0 or self.elbow_down_weight < 0 or
                 self.position_weight <= 0 or self.distal_position_scale < 0 or
                 self.wrist_pitch_scale < 0 or self.shoulder_weight < 0 or
                 self.roll_weight < 0 or
+                (self.max_total_step is not None and self.max_total_step <= 0) or
+                self.elbow_pole_direction.shape != (3,) or
+                not np.isfinite(self.elbow_pole_direction).all() or pole_norm <= 0 or
                 (self.height_flexion_gain is not None and self.height_flexion_gain <= 0) or
                 (self.orient_fade_distance is not None and self.orient_fade_distance <= 0)):
             raise ValueError("Invalid DLS solver settings")
         # Joint 1's anchor is fixed in the world, so the shoulder pitch goal is
         # measured from there. Record the angle the home hand makes with it.
-        pitch_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, SHOULDER_PITCH_JOINT_NAME)
+        pitch_joint = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, shoulder_pitch_joint_name)
         if pitch_joint < 0:
             raise ValueError("Shoulder pitch joint is missing")
         self.scratch.qpos[:] = data.qpos
@@ -423,10 +452,9 @@ class DampedLeastSquaresIK:
                          relative[1, 0] - relative[0, 1]]) / (2 * math.sin(angle))
         return axis * angle
 
-    @staticmethod
-    def _elbow_down_error(shoulder, elbow, wrist):
-        """Pull the elbow under the shoulder-to-wrist line, toward world down."""
-        down = np.array([0.0, 0.0, -1.0])
+    def _elbow_down_error(self, shoulder, elbow, wrist):
+        """Pull the elbow toward a stable pole around the shoulder-wrist line."""
+        pole_direction = self.elbow_pole_direction
         span = wrist - shoulder
         span_norm = float(np.linalg.norm(span))
         if span_norm < 1e-4:
@@ -436,7 +464,8 @@ class DampedLeastSquaresIK:
         along = float(np.dot(offset, span_hat))
         pole = offset - along * span_hat
         pole_norm = float(np.linalg.norm(pole))
-        target_dir = down - float(np.dot(down, span_hat)) * span_hat
+        target_dir = (pole_direction -
+                      float(np.dot(pole_direction, span_hat)) * span_hat)
         target_norm = float(np.linalg.norm(target_dir))
         if pole_norm < 1e-4 or target_norm < 1e-4:
             return np.zeros(3)
@@ -460,6 +489,7 @@ class DampedLeastSquaresIK:
             q = np.asarray(seed, dtype=np.float64).copy()
             if q.shape != self.arm.home.shape or not np.isfinite(q).all():
                 raise ValueError(f"Expected {len(self.arm.home)} finite seed joints")
+        seed_q = q.copy()
         jacp = np.zeros((3, self.model.nv))
         jacr = np.zeros((3, self.model.nv))
         elbow_jacp = np.zeros((3, self.model.nv))
@@ -554,6 +584,14 @@ class DampedLeastSquaresIK:
                 delta *= self.max_step / magnitude
             q[active] = np.clip(q[active] + delta, self.arm.lower[active],
                                 self.arm.upper[active])
+        if self.max_total_step is not None:
+            total_delta = q[active] - seed_q[active]
+            magnitude = float(np.linalg.norm(total_delta))
+            if magnitude > self.max_total_step:
+                q[active] = seed_q[active] + total_delta * (
+                    self.max_total_step / magnitude)
+                q[active] = np.clip(
+                    q[active], self.arm.lower[active], self.arm.upper[active])
         return q
 
 
@@ -578,7 +616,8 @@ def pico_upper_ik(model, data, arm):
         model, data, arm, max_step=0.12, iterations=24,
         orientation_weight=0.0, elbow_weight=0.25, elbow_down_weight=0.15,
         position_weight=4.0, height_flexion_gain=ELBOW_LOWER_FLEXION_GAIN,
-        shoulder_weight=0.2, roll_weight=0.10, active_joints=(0, 1, 2, 3))
+        shoulder_weight=0.2, roll_weight=0.10, active_joints=(0, 1, 2, 3),
+        elbow_pole_direction=(0.0, 0.25, -1.0))
 
 
 class WristOrientationIK:
@@ -590,7 +629,9 @@ class WristOrientationIK:
     """
 
     def __init__(self, model, data, wrist: MujocoArm, *, joint_indices=None,
-                 damping=0.06, max_step=0.12, iterations=16):
+                 damping=0.06, max_step=0.12, iterations=16,
+                 max_total_step=None, joint_limit_margin=0.0,
+                 ee_body_name=EE_BODY_NAME):
         size = len(wrist.qpos_ids)
         indices = range(size) if joint_indices is None else joint_indices
         self.indices = np.array([int(index) for index in indices], dtype=int)
@@ -599,13 +640,20 @@ class WristOrientationIK:
             raise ValueError("Wrist orientation IK needs exactly three wrist joints")
         self.model, self.data, self.wrist = model, data, wrist
         self.scratch = mujoco.MjData(model)
-        self.body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY_NAME)
+        self.body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, ee_body_name)
         self.jacp = np.zeros((3, model.nv))
         self.jacr = np.zeros((3, model.nv))
         self.damping = float(damping)
         self.max_step = float(max_step)
+        self.max_total_step = (None if max_total_step is None
+                               else float(max_total_step))
+        self.joint_limit_margin = float(joint_limit_margin)
         self.iterations = int(iterations)
-        if self.body_id < 0 or self.damping <= 0 or self.max_step <= 0 or self.iterations < 1:
+        if (self.body_id < 0 or self.damping <= 0 or self.max_step <= 0 or
+                (self.max_total_step is not None and self.max_total_step <= 0) or
+                self.joint_limit_margin < 0 or
+                self.iterations < 1):
             raise ValueError("Invalid wrist orientation IK settings")
 
     def solve(self, target_rotation, seed=None):
@@ -622,11 +670,14 @@ class WristOrientationIK:
                        dtype=np.float64).copy()
         if q.shape != self.wrist.home.shape or not np.isfinite(q).all():
             raise ValueError(f"Expected {len(self.wrist.home)} finite seed joints")
+        seed_q = q.copy()
         self.scratch.qpos[:] = self.data.qpos
         self.scratch.qvel[:] = self.data.qvel
         indices = self.indices
         dofs = self.wrist.dof_ids[indices]
-        lower, upper = self.wrist.lower[indices], self.wrist.upper[indices]
+        raw_lower, raw_upper = self.wrist.lower[indices], self.wrist.upper[indices]
+        margin = np.minimum(self.joint_limit_margin, 0.10 * (raw_upper - raw_lower))
+        lower, upper = raw_lower + margin, raw_upper - margin
         for _ in range(self.iterations):
             self.scratch.qpos[self.wrist.qpos_ids] = q
             mujoco.mj_forward(self.model, self.scratch)
@@ -643,6 +694,13 @@ class WristOrientationIK:
             if magnitude > self.max_step:
                 delta *= self.max_step / magnitude
             q[indices] = np.clip(q[indices] + delta, lower, upper)
+        if self.max_total_step is not None:
+            total_delta = q[indices] - seed_q[indices]
+            magnitude = float(np.linalg.norm(total_delta))
+            if magnitude > self.max_total_step:
+                q[indices] = seed_q[indices] + total_delta * (
+                    self.max_total_step / magnitude)
+                q[indices] = np.clip(q[indices], lower, upper)
         return q
 
 
@@ -690,43 +748,243 @@ class PicoHandArmMapper:
 
     The first fresh frame after construction or :meth:`recenter` pairs the
     tracked hand position with the current end-effector position. Stale,
-    missing, or invalid input yields no target so the arm holds; the pairing
-    survives dropouts.
+    missing, or invalid input yields no target so the arm holds. Recovery
+    reanchors at the held pose so an old tracking origin cannot cause a jump.
     """
 
-    def __init__(self, scale=1.0, stale_after=PICO_STALE_SECONDS):
+    def __init__(self, scale=0.6, stale_after=PICO_STALE_SECONDS, *,
+                 deadband_m=0.004, filter_tau_s=0.10, max_speed_m_s=1.0,
+                 max_jump_m=0.12, workspace_min_m=0.30,
+                 workspace_max_m=0.62, outlier_reacquire_frames=3,
+                 max_target_step_limit_m=0.025):
         self.scale = float(scale)
         self.stale_after = float(stale_after)
-        if not math.isfinite(self.scale) or self.scale <= 0 or self.stale_after <= 0:
-            raise ValueError("Pico hand scale and stale timeout must be positive")
+        self.deadband_m = float(deadband_m)
+        self.filter_tau_s = float(filter_tau_s)
+        self.max_speed_m_s = float(max_speed_m_s)
+        self.max_jump_m = float(max_jump_m)
+        self.workspace_min_m = float(workspace_min_m)
+        self.workspace_max_m = float(workspace_max_m)
+        self.outlier_reacquire_frames = int(outlier_reacquire_frames)
+        self.max_target_step_limit_m = float(max_target_step_limit_m)
+        settings = (self.scale, self.stale_after, self.max_speed_m_s,
+                    self.max_jump_m, self.workspace_min_m, self.workspace_max_m,
+                    self.max_target_step_limit_m)
+        if (not np.isfinite(settings).all() or min(settings) <= 0 or
+                not math.isfinite(self.deadband_m) or self.deadband_m < 0 or
+                not math.isfinite(self.filter_tau_s) or self.filter_tau_s < 0 or
+                self.workspace_min_m >= self.workspace_max_m or
+                self.outlier_reacquire_frames < 2):
+            raise ValueError("Invalid Pico hand conditioning settings")
         self.hand_origin = None
         self.ee_reference = None
         self.status = "waiting"
         self.hand_position = None
+        self.filtered_hand_position = None
+        self.accepted_hand_position = None
+        self.last_raw_position = None
+        self.last_target = None
+        self.last_revision = None
+        self.last_frame_time = None
+        self.needs_reacquire = False
+        self.outlier_count = 0
+        self.workspace_clip_count = 0
+        self.reacquisition_count = 0
+        self.max_raw_step_m = 0.0
+        self.max_target_step_m = 0.0
+        self.workspace_clipped = False
+        self.outlier_streak = 0
+        self.outlier_candidate = None
 
     def recenter(self):
         self.hand_origin = self.ee_reference = None
+        self.filtered_hand_position = None
+        self.accepted_hand_position = None
+        self.last_raw_position = None
+        self.last_target = None
+        self.last_revision = None
+        self.last_frame_time = None
+        self.needs_reacquire = False
+        self.outlier_streak = 0
+        self.outlier_candidate = None
 
-    def update(self, snapshot, ee_position, now):
+    def _project_workspace(self, target, shoulder_position):
+        self.workspace_clipped = False
+        if shoulder_position is None:
+            return target
+        shoulder = np.asarray(shoulder_position, dtype=np.float64)
+        if shoulder.shape != (3,) or not np.isfinite(shoulder).all():
+            raise ValueError("Expected a finite shoulder position")
+        offset = target - shoulder
+        reach = float(np.linalg.norm(offset))
+        if reach < 1e-8:
+            return target
+        clipped_reach = float(np.clip(
+            reach, self.workspace_min_m, self.workspace_max_m))
+        if not math.isclose(reach, clipped_reach, abs_tol=1e-9):
+            target = shoulder + offset * (clipped_reach / reach)
+            self.workspace_clipped = True
+            self.workspace_clip_count += 1
+        return target
+
+    def update(self, snapshot, ee_position, now, shoulder_position=None):
         """Return the target end-effector position, or None to hold the arm."""
         frame = snapshot.frame
         if snapshot.error:
             self.status = "invalid"
+            self.needs_reacquire = True
             return None
         if frame is None:
             self.status = "waiting"
+            self.needs_reacquire = self.hand_origin is not None
             return None
         if now - frame.received_at > self.stale_after:
             self.status = "holding"
+            self.needs_reacquire = self.hand_origin is not None
             return None
-        self.hand_position = np.asarray(frame.pose[:3, 3], dtype=np.float64).copy()
-        if self.hand_origin is None:
-            self.hand_origin = self.hand_position.copy()
-            self.ee_reference = np.asarray(ee_position, dtype=np.float64).copy()
-            self.status = "calibrated"
-        else:
-            self.status = "tracking"
-        return self.ee_reference + self.scale * (self.hand_position - self.hand_origin)
+        ee_position = np.asarray(ee_position, dtype=np.float64)
+        raw = np.asarray(frame.pose[:3, 3], dtype=np.float64).copy()
+        if ee_position.shape != (3,) or not np.isfinite(ee_position).all():
+            raise ValueError("Expected a finite end-effector position")
+        if raw.shape != (3,) or not np.isfinite(raw).all():
+            self.status = "invalid"
+            self.needs_reacquire = True
+            return None
+        self.hand_position = raw
+
+        # Do not filter the same latest frame again at the control-loop rate.
+        if (snapshot.revision == self.last_revision and self.last_target is not None
+                and not self.needs_reacquire):
+            self.status = "tracking clipped" if self.workspace_clipped else "tracking"
+            return self.last_target.copy()
+
+        calibrating = self.hand_origin is None
+        reacquiring = self.needs_reacquire and not calibrating
+        if calibrating or reacquiring:
+            anchor_target = (self.last_target.copy()
+                             if reacquiring and self.last_target is not None
+                             else ee_position.copy())
+            self.hand_origin = raw.copy()
+            self.filtered_hand_position = raw.copy()
+            self.accepted_hand_position = raw.copy()
+            self.last_raw_position = raw.copy()
+            self.ee_reference = anchor_target.copy()
+            self.last_target = self._project_workspace(
+                anchor_target, shoulder_position)
+            self.last_revision = snapshot.revision
+            self.last_frame_time = frame.received_at
+            self.needs_reacquire = False
+            self.outlier_streak = 0
+            self.outlier_candidate = None
+            if reacquiring:
+                self.reacquisition_count += 1
+                self.status = "reacquired"
+            else:
+                self.status = "calibrated"
+            return self.last_target.copy()
+
+        raw_step = float(np.linalg.norm(raw - self.last_raw_position))
+        self.max_raw_step_m = max(self.max_raw_step_m, raw_step)
+        if raw_step > self.max_jump_m:
+            self.outlier_count += 1
+            if (self.outlier_candidate is None or
+                    np.linalg.norm(raw - self.outlier_candidate) >
+                    self.max_jump_m * 0.5):
+                self.outlier_streak = 1
+            else:
+                self.outlier_streak += 1
+            self.outlier_candidate = raw.copy()
+            self.last_revision = snapshot.revision
+            self.last_frame_time = frame.received_at
+            if self.outlier_streak >= self.outlier_reacquire_frames:
+                # A stable cluster far from the previous coordinates is a
+                # tracking-frame discontinuity, not a one-frame spike. Rebase
+                # it onto the exact held target so recovery cannot jump.
+                anchor_target = (self.last_target.copy() if self.last_target is not None
+                                 else ee_position.copy())
+                self.hand_origin = raw.copy()
+                self.filtered_hand_position = raw.copy()
+                self.accepted_hand_position = raw.copy()
+                self.last_raw_position = raw.copy()
+                self.ee_reference = anchor_target.copy()
+                self.last_target = self._project_workspace(
+                    anchor_target, shoulder_position)
+                self.outlier_streak = 0
+                self.outlier_candidate = None
+                self.reacquisition_count += 1
+                self.status = "reacquired"
+                return self.last_target.copy()
+            self.status = "outlier"
+            return self.last_target.copy()
+
+        dt = max(1e-3, min(0.25, frame.received_at - self.last_frame_time))
+        self.last_raw_position = raw.copy()
+        self.outlier_streak = 0
+        self.outlier_candidate = None
+        if np.linalg.norm(raw - self.accepted_hand_position) >= self.deadband_m:
+            self.accepted_hand_position = raw.copy()
+        delta = self.accepted_hand_position - self.filtered_hand_position
+        magnitude = float(np.linalg.norm(delta))
+        max_delta = self.max_speed_m_s * dt
+        if magnitude > max_delta:
+            delta *= max_delta / magnitude
+        alpha = 1.0 if self.filter_tau_s == 0 else 1.0 - math.exp(
+            -dt / self.filter_tau_s)
+        self.filtered_hand_position += alpha * delta
+        target = self.ee_reference + self.scale * (
+            self.filtered_hand_position - self.hand_origin)
+        target = self._project_workspace(target, shoulder_position)
+        target_delta = target - self.last_target
+        target_step = float(np.linalg.norm(target_delta))
+        if target_step > self.max_target_step_limit_m:
+            target = self.last_target + target_delta * (
+                self.max_target_step_limit_m / target_step)
+            target_step = self.max_target_step_limit_m
+        self.max_target_step_m = max(self.max_target_step_m, target_step)
+        self.last_target = target
+        self.last_revision = snapshot.revision
+        self.last_frame_time = frame.received_at
+        self.status = "tracking clipped" if self.workspace_clipped else "tracking"
+        return target.copy()
+
+
+def relative_wrist_rotation(tracked_rotation, calibration_rotation,
+                            neutral_rotation, gain=0.50):
+    """Apply the glove's calibrated relative rotation to the current arm pose.
+
+    The upper-arm IK is free to change the end-effector's neutral world
+    orientation. Applying the glove delta to that neutral pose avoids forcing
+    the three wrist joints to counter-rotate every shoulder movement.
+    """
+    rotations = [np.asarray(value, dtype=np.float64) for value in (
+        tracked_rotation, calibration_rotation, neutral_rotation)]
+    for value in rotations:
+        if (value.shape != (3, 3) or not np.isfinite(value).all() or
+                not np.allclose(value.T @ value, np.eye(3), atol=2e-3) or
+                not np.isclose(np.linalg.det(value), 1.0, atol=2e-3)):
+            raise ValueError("Expected proper wrist rotation matrices")
+    gain = float(gain)
+    if not math.isfinite(gain) or not 0 < gain <= 1:
+        raise ValueError("Wrist rotation gain must be in (0, 1]")
+    tracked, calibration, neutral = rotations
+    relative = tracked @ calibration.T
+    scaled = Rotation.from_rotvec(
+        gain * Rotation.from_matrix(relative).as_rotvec()).as_matrix()
+    return scaled @ neutral
+
+
+def limit_joint_goal(goal, seed, max_total_step=0.22):
+    """Bound the complete joint-goal change after position and wrist IK."""
+    goal = np.asarray(goal, dtype=np.float64).copy()
+    seed = np.asarray(seed, dtype=np.float64)
+    if (goal.shape != seed.shape or not np.isfinite(goal).all() or
+            not np.isfinite(seed).all()):
+        raise ValueError("Joint goal and seed must be matching finite vectors")
+    delta = goal - seed
+    magnitude = float(np.linalg.norm(delta))
+    if magnitude > max_total_step:
+        goal = seed + delta * (max_total_step / magnitude)
+    return goal
 
 
 def load_articulated_scene(*, wrist_only=False):
@@ -815,7 +1073,7 @@ class ManualJointSliderPanel:
 def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
     arm_imu_source=None, manual_joints=None,
         duration=None, headless=False, report_path=None,
-        pico_scale=1.0, log_csv=None):
+        pico_scale=0.6, log_csv=None):
     """Run the arm and glove-finger loops together in the articulated scene.
 
     MuJoCo physics advances at the model's 500 Hz timestep.  Hand tracking is
@@ -888,13 +1146,17 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
     if wrist_only:
         wrist_ik = WristOrientationIK(model, data, arm)
     elif arm_input == PICO_HAND_ARM_INPUT:
-        wrist_ik = WristOrientationIK(model, data, arm, joint_indices=(4, 5, 6))
+        wrist_ik = WristOrientationIK(
+            model, data, arm, joint_indices=(4, 5, 6),
+            max_total_step=0.15, joint_limit_margin=0.08)
     else:
         wrist_ik = None
     ee = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY_NAME)
+    shoulder = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, SHOULDER_BODY_NAME)
     origin = np.eye(4)
     origin[:3, :3] = data.xmat[ee].reshape(3, 3)
     origin[:3, 3] = data.xpos[ee]
+    wrist_reference = arm.home[4:].copy()
     wrist_source = SyntheticWristPoseSource(origin) if arm_input == "synthetic" else None
     if arm_input in ("pico-controller", "pico-wrist", PICO_HAND_ARM_INPUT) and pose_source is None:
         raise ValueError(f"{arm_input} arm input requires a pose source")
@@ -972,6 +1234,7 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                         arm_imu_source.recenter(recenter_pose)
                         origin = recenter_pose
                         joint_slew[:] = data.qpos[arm.qpos_ids]
+                        wrist_reference[:] = joint_slew[4:]
                         arm.set_target(joint_slew)
                         arm_status = "calibrating"
                         if pico_mapper is not None:
@@ -998,28 +1261,38 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                             report.arm_ik_updates += 1
                         elif pico_mapper is not None:
                             scratch = ik.scratch
-                            if pico_mapper.hand_origin is None:
-                                # Reference the commanded pose, not the servo's
-                                # gravity sag, so calibration does not drop the arm.
-                                scratch.qpos[:] = data.qpos
-                                scratch.qpos[arm.qpos_ids] = arm.target
-                                mujoco.mj_kinematics(model, scratch)
+                            # Reference the commanded pose, not servo sag or a
+                            # stale IK trial pose, including after reacquisition.
+                            scratch.qpos[:] = data.qpos
+                            scratch.qpos[arm.qpos_ids] = arm.target
+                            mujoco.mj_kinematics(model, scratch)
                             target_position = pico_mapper.update(
-                                pose_source.read(), scratch.xpos[ee], now)
+                                pose_source.read(), scratch.xpos[ee], now,
+                                scratch.xpos[shoulder])
                             arm_status = f"hand {pico_mapper.status}"
                             imu_snapshot = arm_imu_source.read(origin, now=now)
                             wrist_rotation = (None if imu_snapshot.pose is None
                                               else imu_snapshot.pose[:3, :3])
-                            if target_position is None and wrist_rotation is not None:
-                                # The glove keeps the wrist while hand tracking drops out.
-                                command_arm(wrist_ik.solve(wrist_rotation, seed=arm.target))
                             if target_position is not None:
                                 target_pose = np.eye(4)
                                 target_pose[:3, :3] = data.xmat[ee].reshape(3, 3)
                                 target_pose[:3, 3] = target_position
                                 goal = ik.solve(target_pose, seed=arm.target)
                                 if wrist_rotation is not None:
-                                    goal = wrist_ik.solve(wrist_rotation, seed=goal)
+                                    neutral_goal = goal.copy()
+                                    neutral_goal[4:] = wrist_reference
+                                    scratch.qpos[:] = data.qpos
+                                    scratch.qpos[arm.qpos_ids] = neutral_goal
+                                    mujoco.mj_kinematics(model, scratch)
+                                    wrist_target = relative_wrist_rotation(
+                                        wrist_rotation, origin[:3, :3],
+                                        scratch.xmat[ee].reshape(3, 3))
+                                    goal = wrist_ik.solve(wrist_target, seed=goal)
+                                    # Restore end-effector translation after
+                                    # the wrist orientation pass.
+                                    goal = ik.solve(target_pose, seed=goal)
+                                goal = limit_joint_goal(goal, arm.target)
+                                goal = np.clip(goal, arm.lower, arm.upper)
                                 command_arm(goal)
                                 scratch.qpos[arm.qpos_ids] = goal
                                 mujoco.mj_kinematics(model, scratch)
@@ -1029,7 +1302,9 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                                 report.arm_ik_updates += 1
                                 if csv_file is not None:
                                     values = (now - started, *target_position, *data.xpos[ee],
-                                              *pico_mapper.hand_position, *goal)
+                                              *pico_mapper.hand_position,
+                                              *pico_mapper.filtered_hand_position,
+                                              int(pico_mapper.workspace_clipped), *goal)
                                     csv_file.write(",".join(f"{v:.6f}" for v in values) + "\n")
                                     pico_rows += 1
                         elif arm_input in PALM_IMU_ARM_INPUTS:
@@ -1192,6 +1467,11 @@ def run(source, *, finger_input, arm_input="synthetic", pose_source=None,
                 "last_target": None if pico_target is None else pico_target.tolist(),
                 "last_ee": data.xpos[ee].tolist(),
                 "last_ik_error_m": pico_ik_error,
+                "outliers": pico_mapper.outlier_count,
+                "workspace_clips": pico_mapper.workspace_clip_count,
+                "reacquisitions": pico_mapper.reacquisition_count,
+                "max_raw_step_m": pico_mapper.max_raw_step_m,
+                "max_target_step_m": pico_mapper.max_target_step_m,
             }
         report.elapsed_seconds = time.monotonic() - started
         report.simulation_seconds = float(data.time)
@@ -1234,7 +1514,7 @@ def main(argv=None):
     parser.add_argument("--duration", type=positive_number)
     parser.add_argument("--report")
     parser.add_argument("--pico-scale", type=positive_number,
-                        help="pico-hand: robot metres per tracked hand metre (default 1.0)")
+                        help="pico-hand: robot metres per tracked hand metre (default 0.6)")
     parser.add_argument("--log-csv", metavar="PATH",
                         help="pico-hand: per-update target log (default /tmp/vega-pico-hand-<time>.csv)")
     args = parser.parse_args(argv)
@@ -1305,7 +1585,7 @@ def main(argv=None):
                 pose_source=pose_source, arm_imu_source=arm_imu_source,
                 manual_joints=args.joints, duration=args.duration,
                 headless=args.headless, report_path=args.report,
-                pico_scale=args.pico_scale or 1.0, log_csv=args.log_csv)
+                pico_scale=args.pico_scale or 0.6, log_csv=args.log_csv)
         finally:
             for closeable in (arm_imu_source, source, pose_source):
                 if closeable is None:

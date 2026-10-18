@@ -232,14 +232,30 @@ fixed IMU-to-wrist transform so the sensor axes map to the simulated hand.
 
 Pico hand position drives shoulder and elbow (j1–j4); the Wuji glove drives wrist
 (j5–j7) and fingers. DexStream must run with `--input hand --disable-world-frame-snap`.
-Start everything with `./scripts/launch_wuji_vega_pico_hand.sh` (optional
-`PICO_SCALE` env for `--pico-scale`). On the Pico, open `https://<WIFI_IP>:8091/`,
+Start everything with `./scripts/launch_wuji_vega_pico_hand.sh` (translation
+scale defaults to `0.6`; optional `PICO_SCALE` env for `--pico-scale`). On the
+Pico, open `https://<WIFI_IP>:8091/`,
 accept the certificate, enter VR **without controllers** (hand tracking on). Hold
 the gloved left hand in view, stay still, then press **R** in the sim to recenter.
 If hand tracking is lost, the arm holds its last pose. The sim prints an XYZ log CSV
-(default `/tmp/vega-pico-hand-<time>.csv`) with columns: `t`, `target_x/y/z`,
-`ee_x/y/z`, `pico_x/y/z`, `j1`…`j7`. Wearing the glove can reduce Pico hand-tracking
-quality; keep the hand visible to the headset.
+(default `/tmp/vega-pico-hand-<time>.csv`) with columns for target, achieved EE,
+raw and filtered Pico position, workspace clipping, and `j1`…`j7`. Wearing the
+glove can reduce Pico hand-tracking quality; keep the hand visible to the headset.
+
+### Bilateral Pico hand tracking
+
+For two gloves and both simulated Vega arms in one MuJoCo world, use:
+
+```bash
+./scripts/launch_wuji_vega_bimanual_pico.sh
+```
+
+Pico left/right wrist positions independently drive joints 1-4 on the matching
+arms. The matching glove IMUs drive joints 5-7 and their skeletons drive the 20
+finger joints per side. Put both Pico controllers down, enter AR with both hands
+visible, hold both gloves still for one second, then press **R** to anchor both
+sides. The launcher requires exactly one discovered left glove and one right
+glove unless their serials are supplied explicitly.
 
 ### Pico controller for wrist only
 

@@ -110,6 +110,7 @@ def fake_sdk(devices=None, side="left", subscribe_error=None):
     resource.subscribe_with_callback.return_value = subscription
     resource.subscribe_with_callback.side_effect = subscribe_error
     glove = Mock()
+    glove.serial_number = "glove-direct"
     glove.hand_side.return_value.get.return_value = side
     glove.version.return_value.get.return_value = "test-firmware"
     glove.hand_skeleton.return_value = resource
@@ -160,6 +161,37 @@ class GloveTests(unittest.TestCase):
         self.assertEqual(manager.switch_user.call_args_list[0].args, ("",))
         self.assertEqual(manager.switch_user.call_args_list[-1].args, ("previous",))
         glove.enable.assert_not_called()
+
+    def test_custom_device_name_supports_parallel_connections(self):
+        sdk, manager, _, _ = fake_sdk()
+        source = GloveSource(sdk=sdk, device_name="wuji_bimanual_glove_left")
+        source.close()
+        manager.connect.assert_called_once_with(
+            sn="glove1", device_name="wuji_bimanual_glove_left")
+        manager.disconnect.assert_called_once_with("wuji_bimanual_glove_left")
+
+    def test_direct_address_bypasses_multicast_scan(self):
+        sdk, manager, _, _ = fake_sdk()
+        source = GloveSource(
+            sdk=sdk, address="192.168.1.100:50001",
+            device_name="wuji_bimanual_glove_left")
+        try:
+            self.assertEqual(source.serial, "glove-direct")
+            self.assertEqual(source.address, "192.168.1.100:50001")
+            manager.scan.assert_not_called()
+            manager.connect.assert_called_once_with(
+                address="192.168.1.100:50001",
+                device_name="wuji_bimanual_glove_left")
+        finally:
+            source.close()
+
+    def test_direct_address_checks_expected_serial(self):
+        sdk, manager, _, _ = fake_sdk()
+        with self.assertRaisesRegex(RuntimeError, "expected wrong"):
+            GloveSource(
+                "wrong", sdk=sdk, address="192.168.1.100:50001",
+                device_name="wuji_bimanual_glove_left")
+        manager.disconnect.assert_called_once_with("wuji_bimanual_glove_left")
 
     def test_delayed_transport_frame_is_already_stale(self):
         sdk, _, glove, _ = fake_sdk()

@@ -1,6 +1,6 @@
 # New machine: glove + Pico headset simulation
 
-From a fresh Ubuntu laptop to the Vega-1U left arm moving in MuJoCo under a Wuji glove and a Pico headset. Simulation only; nothing here commands the physical robot.
+From a fresh Ubuntu laptop to both Vega-1U arms moving in MuJoCo under two Wuji gloves and a Pico headset. Simulation only; nothing here commands the physical robot.
 
 ## 1. Install (once)
 
@@ -23,7 +23,7 @@ A jog window and the MuJoCo viewer open. Every launcher appends what it ran to `
 
 ## 2. Glove networking
 
-The glove is always at `192.168.1.100` and needs the laptop at `192.168.1.50` on the Ethernet port.
+The gloves normally use `192.168.1.100` (left) and `192.168.1.101` (right), and need the laptop at `192.168.1.50` on the Ethernet port.
 
 1. Glove acquisition board -> supplied USB-C cable -> **powered** USB-C/Ethernet adapter -> laptop Ethernet.
 2. Configure and check:
@@ -34,7 +34,7 @@ The glove is always at `192.168.1.100` and needs the laptop at `192.168.1.50` on
    ```
 
    The script makes a temporary profile, removed on reboot, and never changes the internet route.
-   If Wi-Fi is also on `192.168.1.x` (usual with the Pico router), it routes only the glove's address over Ethernet so the Pico stays on Wi-Fi.
+   If Wi-Fi is also on `192.168.1.x` (usual with the Pico router), it routes only the two glove addresses over Ethernet so the Pico stays on Wi-Fi.
    If the port already has an address from another profile, it tells you to run `nmcli device disconnect <port>` first.
 3. `discover` should print one left glove. The launchers use it automatically. With several gloves, pass the serial as an argument or set `GLOVE_SN`.
 
@@ -56,22 +56,25 @@ The launchers find the Wi-Fi address and DexStream on their own. Override with `
 | Glove fingers + wrist | `scripts/launch_wuji_vega_glove_wrist.sh` | glove |
 | Glove fingers + whole arm (IMU) | `scripts/launch_wuji_vega_glove_arm.sh` | glove |
 | **Hand + Pico** (arm from headset, wrist and fingers from glove) | `scripts/launch_wuji_vega_pico_hand.sh` | glove + Pico |
+| **Both hands + Pico** (both arms, wrists, and hands) | `scripts/launch_wuji_vega_bimanual_pico.sh` | two gloves + Pico |
 | DexStream only (keeps the Pico page up) | `scripts/launch_dexstream.sh` | Pico |
 
-**Hand + Pico steps:**
+**Both hands + Pico steps:**
 
-1. Start the launcher.
+1. Start `scripts/launch_wuji_vega_bimanual_pico.sh`.
 2. Open the Pico page and enter AR with the controllers down.
-3. Hold the glove still for one second.
-4. Wait for `hand tracking` on the status line.
-5. Hold your hand where you want to work and press **R** in the MuJoCo window.
+3. Hold both gloves still for one second.
+4. Wait for both `L` and `R` status entries to show tracking.
+5. Hold both hands where you want to work and press **R** in the MuJoCo window.
 
-Each run logs target, achieved and Pico XYZ plus joints to `/tmp/vega-pico-hand-<time>.csv`. `PICO_SCALE=1.3` scales arm motion.
+Each run logs raw/filtered Pico XYZ, target, achieved pose, workspace clipping,
+and joints to `/tmp/vega-pico-hand-<time>.csv`. Translation scale defaults to
+`0.6`; set `PICO_SCALE` to tune it.
 
 To restart the sim without dropping the Pico page:
 
 1. Run `scripts/launch_dexstream.sh` in one terminal and leave it.
-2. Run `scripts/launch_wuji_vega_pico_hand.sh` in another. It sees DexStream already running and starts only the sim.
+2. Run `scripts/launch_wuji_vega_bimanual_pico.sh` in another. It sees DexStream already running and starts only the sim.
 
 ## 5. Troubleshooting
 

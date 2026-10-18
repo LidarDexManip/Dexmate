@@ -171,27 +171,29 @@ class PicoControllerPoseSource(_PicoWristPoseSource):
 
 
 class PicoHandPoseSource(_PicoWristPoseSource):
-    """Subscribe to the left hand in DexStream's ``vr/hands``.
+    """Subscribe to one hand in DexStream's ``vr/hands``.
 
     Hand payloads omit index triggers; tracked hands are treated as fully pressed.
-    Missing ``left`` means no hand data and does not invalidate prior frames.
+    A missing selected side means no hand data and does not invalidate prior frames.
     """
 
     _invalid_frame_prefix = "Invalid Pico hand frame"
     _zenoh_input_label = "hand"
 
-    def __init__(self, topic="vr/hands", *, session=None, zenoh_module=None):
+    def __init__(self, topic="vr/hands", *, side="left", session=None, zenoh_module=None):
+        if side not in ("left", "right"):
+            raise ValueError("Pico hand side must be 'left' or 'right'")
+        self.side = side
         super().__init__(topic, session=session, zenoh_module=zenoh_module)
 
-    @staticmethod
-    def parse_payload(payload, *, now_ns=None, now_monotonic=None):
-        """Parse DexStream hand JSON into one left wrist frame, or None if no left hand."""
+    def parse_payload(self, payload, *, now_ns=None, now_monotonic=None):
+        """Parse one selected wrist frame, or return None while it is untracked."""
         value = _decode_json_payload(payload)
-        left = value.get("left")
-        if left is None:
+        hand = value.get(self.side)
+        if hand is None:
             return None
         timestamp_ns = _validate_timestamp_ns(value, now_ns=now_ns, label="hand")
-        pose = validate_rigid_pose(left["wrist"])
+        pose = validate_rigid_pose(hand["wrist"])
         # DexStream sends a wrist at the origin while the hand is not tracked.
         if np.allclose(pose[:3, 3], 0.0, atol=1e-6):
             return None

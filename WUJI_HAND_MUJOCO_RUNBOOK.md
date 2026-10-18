@@ -6,6 +6,12 @@ this runbook retain historical experiments and older launch commands.
 
 This runbook covers the current Wuji Glove connection, simulated Wuji Hand launch, bringing up both hands, and the next Vega 1U integration steps.
 
+The current one-window bilateral Vega simulation is now
+`scripts/launch_wuji_vega_bimanual_pico.sh`; see
+[WUJI_VEGA_MUJOCO_SETUP.md](WUJI_VEGA_MUJOCO_SETUP.md#bilateral-pico-hand-tracking).
+The older two-window instructions under “Deferred: Bring Up Both Hands” remain
+historical notes for standalone hand models.
+
 ## Current single-arm simulation path — October 8, 2026
 
 The newer `wuji_teleop` pipeline uses the Wuji Hand 2 model and the current
@@ -361,7 +367,7 @@ Only after the single-hand mapping is stable in MuJoCo:
 
 Record the tested glove serial, model configuration, joint mapping, and observed result before increasing the command rate or adding arm motion.
 
-## Deferred: Bring Up Both Hands
+## Historical: standalone two-window hand setup
 
 Return to the two-hand setup after the right glove's Ethernet/data adapter path is repaired and both fixed addresses respond:
 

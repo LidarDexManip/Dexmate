@@ -151,7 +151,8 @@ def select_glove(devices, serial=None):
 class GloveSource:
     """A single glove subscription. Never opens a robot-hand command channel."""
 
-    def __init__(self, serial=None, user_id="", *, sdk=None):
+    def __init__(self, serial=None, user_id="", *, sdk=None, device_name=None,
+                 address=None):
         if sdk is None:
             import wuji_sdk as sdk
         self._manager = sdk.SdkManager.instance()
@@ -159,15 +160,29 @@ class GloveSource:
         self._subscription = None
         self._glove = None
         self._previous_user = None
-        self._device_name = "wuji_sim_glove"
+        # The SDK identifies live connections by device_name.  Keep the legacy
+        # name for a single glove, while allowing bilateral callers to give
+        # each simultaneously connected glove a distinct name.
+        self._device_name = device_name or "wuji_sim_glove"
         self._closed = False
         try:
-            device = select_glove(scan_gloves(self._manager, sdk), serial)
-            self.serial = device.sn
-            self.address = device.address
+            if address is None:
+                device = select_glove(scan_gloves(self._manager, sdk), serial)
+                self.serial = device.sn
+                self.address = device.address
+                connection = {"sn": self.serial}
+            else:
+                self.address = address
+                connection = {"address": address}
             self._previous_user = self._manager.current_user()["user_id"]
             self._manager.switch_user(user_id)
-            self._glove = self._manager.connect(sn=self.serial, device_name=self._device_name)
+            self._glove = self._manager.connect(
+                **connection, device_name=self._device_name)
+            if address is not None:
+                self.serial = self._glove.serial_number
+                if serial is not None and self.serial != serial:
+                    raise RuntimeError(
+                        f"Glove at {address} has serial {self.serial}, expected {serial}")
             self.side = self._glove.hand_side().get()
             if self.side not in ("left", "right"):
                 raise ValueError(f"Unsupported glove side: {self.side!r}")

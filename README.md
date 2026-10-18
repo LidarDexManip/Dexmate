@@ -6,7 +6,7 @@ Two teleoperation setups are documented here. Install and run the one you are us
 | --- | --- | --- |
 | [Pico on the physical Vega-1U](#1-pico-teleop-on-the-physical-vega-1u) | Both arms, from the Pico controllers | Laptop WebXR page, laptop leader, Jetson follower |
 | [Wuji glove in MuJoCo](#2-wuji-glove-teleop-in-mujoco) | Simulated Wuji Hand 2 fingers, plus a chosen wrist or arm mode | Laptop MuJoCo viewer |
-| [Glove + Pico headset quick start](#3-quick-start-glove-and-pico-headset-in-mujoco) | Pico hand tracking moves the simulated arm; the glove drives wrist and fingers | Laptop MuJoCo viewer + Pico browser |
+| [Gloves + Pico headset quick start](#3-quick-start-glove-and-pico-headset-in-mujoco) | Pico hand tracking moves one or both simulated arms; matching gloves drive wrists and fingers | Laptop MuJoCo viewer + Pico browser |
 
 The Pico section drives the physical robot. The Wuji glove section drives a MuJoCo simulation on the laptop. An optional Pico wrist mode at the end of the glove section uses the headset only to rotate the simulated wrist while the glove still drives the fingers.
 
@@ -251,7 +251,7 @@ cd ~/Documents/Dexmate
 scripts/setup_sim.sh
 ```
 
-This creates `.venv` and installs the pinned packages, DexStream and the Pico page's three.js into it. It then runs the tests and ends with `Setup complete`. It needs `git`, `curl`, and Python 3.10-3.12 with venv (3.11 tested).
+This creates `.venv` and installs the pinned packages, DexStream and the Pico page's three.js into it. It then runs the tests and ends with `Setup complete`. It needs `git`, `curl`, and Python 3.11-3.12 with venv.
 
 ### Glove setup
 
@@ -263,7 +263,7 @@ This creates `.venv` and installs the pinned packages, DexStream and the Pico pa
    .venv/bin/python -m wuji_teleop discover --seconds 3
    ```
 
-   The glove is at `192.168.1.100` and the laptop gets `192.168.1.50`. The script uses a temporary profile and leaves the internet route alone. If Wi-Fi is also on `192.168.1.x`, it routes only the glove's address over Ethernet so the Pico stays on Wi-Fi.
+   The left/right gloves normally use `192.168.1.100` and `.101`; the laptop gets `192.168.1.50`. The script uses a temporary profile and leaves the internet route alone. If Wi-Fi is also on `192.168.1.x`, it routes only the two glove addresses over Ethernet so the Pico stays on Wi-Fi.
 3. The launchers connect to the only glove found. With several gloves, pass the serial as the first argument or set `GLOVE_SN`.
 
 ### Pico headset setup
@@ -280,6 +280,12 @@ This creates `.venv` and installs the pinned packages, DexStream and the Pico pa
 | `scripts/launch_vega_joint_limits.sh` | Joint limit tool: slider and −/+ per left-arm joint inside `ARM_JOINT_LIMITS` (`wuji_teleop/vega_arm_sim.py`) | nothing |
 | `scripts/launch_wuji_vega_hand_only.sh` | Hand only: glove drives the fingers, arm fixed | glove |
 | `scripts/launch_wuji_vega_pico_hand.sh` | Hand + Pico: headset hand tracking moves the arm (joints 1-4), the glove turns the wrist (joints 5-7) and drives the fingers | glove + Pico |
+| `scripts/launch_wuji_vega_bimanual_pico.sh` | Bilateral: Pico tracks both hands; two gloves drive matching wrists and fingers | two gloves + Pico |
+
+For bilateral use, the gloves normally answer at `192.168.1.100` and `.101`.
+The network helper installs host routes for both when Pico Wi-Fi is on the same
+subnet. The bilateral launcher auto-selects one discovered glove of each side,
+or accepts Wi-Fi IP, left serial, and right serial as positional arguments.
 
 Close the MuJoCo window or press Ctrl-C to stop. Glove-only wrist and whole-arm modes are in [section 2](#run-the-glove).
 
@@ -291,11 +297,17 @@ Close the MuJoCo window or press Ctrl-C to stop. Glove-only wrist and whole-arm 
 4. Wait for the status line to show `hand tracking`.
 5. Hold your hand in a comfortable working position and press **R** in the MuJoCo window.
 
+For the bilateral pre-hardware acceptance sequence and report thresholds, see
+[RETARGETING_ACCEPTANCE.md](RETARGETING_ACCEPTANCE.md).
+
 **Details:**
 
 - The arm holds when the headset loses your hand.
-- `PICO_SCALE=1.3 scripts/launch_wuji_vega_pico_hand.sh` makes the robot hand move 1.3 m per metre of yours.
-- Each run logs target, achieved and Pico XYZ plus all seven joints to `/tmp/vega-pico-hand-<time>.csv`.
+- Pico motion defaults to 0.6 robot metres per tracked metre; use `PICO_SCALE`
+  to tune it. Tracking is filtered, jump-limited, and projected into the safe
+  arm workspace before IK.
+- Each run logs raw/filtered Pico XYZ, target, achieved pose, workspace clipping,
+  and all seven joints to `/tmp/vega-pico-hand-<time>.csv`.
 
 To restart the sim without dropping the Pico page:
 

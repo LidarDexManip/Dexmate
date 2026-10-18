@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 # Temporary, dedicated glove connection; leave Wi-Fi/default routing alone.
-# The glove is at 192.168.1.100 and needs the laptop at 192.168.1.50. When Wi-Fi
-# (for the Pico) is also on 192.168.1.0/24, only the glove's address is routed
-# over Ethernet so the Pico keeps using Wi-Fi.
+# The gloves are at 192.168.1.100/.101 and need the laptop at 192.168.1.50.
+# When Wi-Fi (for the Pico) is also on 192.168.1.0/24, only those two glove
+# addresses are routed over Ethernet so the Pico keeps using Wi-Fi.
 set -euo pipefail
 
 wuji_interface="${1:-}"
-glove_ip="192.168.1.100"
+default_glove_ips=("192.168.1.100" "192.168.1.101")
+glove_ips=("${@:2}")
+explicit_glove_ips=false
+if (( ${#glove_ips[@]} )); then
+  explicit_glove_ips=true
+else
+  glove_ips=("${default_glove_ips[@]}")
+fi
 laptop_ip="192.168.1.50"
 
 if [[ "$wuji_interface" == "--help" || "$wuji_interface" == "-h" ]]; then
-  echo "Usage: $0 [ETHERNET_INTERFACE]"
-  echo "Default: the first wired interface with a link. Profile is in memory only (gone after reboot)."
+  echo "Usage: $0 [ETHERNET_INTERFACE] [GLOVE_IP ...]"
+  echo "Defaults: first wired interface with a link; routes both 192.168.1.100 and .101."
+  echo "For two Ethernet ports, run once per port with that port's glove IP."
+  echo "Profiles are in memory only (gone after reboot)."
   exit 0
 fi
+for glove_ip in "${glove_ips[@]}"; do
+  if [[ "$glove_ip" != "192.168.1.100" && "$glove_ip" != "192.168.1.101" ]]; then
+    echo "Unsupported glove IP: ${glove_ip} (expected 192.168.1.100 or 192.168.1.101)" >&2
+    exit 2
+  fi
+done
 if [[ -z "$wuji_interface" ]]; then
   for iface in /sys/class/net/*; do
     name="$(basename "$iface")"
@@ -38,10 +53,19 @@ if [[ "$(cat "/sys/class/net/${wuji_interface}/carrier")" != 1 ]]; then
   echo "No Ethernet carrier on ${wuji_interface}. Check the powered glove adapter and cable." >&2
   exit 1
 fi
-if ping -c 1 -W 1 "$glove_ip" >/dev/null 2>&1 &&
-    ip -4 route get "$glove_ip" | grep -q "dev ${wuji_interface}"; then
-  echo "Glove already reachable at ${glove_ip} over ${wuji_interface}."
+routes_ready=true
+for glove_ip in "${glove_ips[@]}"; do
+  if ! ip -4 route get "$glove_ip" | grep -q "dev ${wuji_interface}" ||
+      ! ping -c 1 -W 1 "$glove_ip" >/dev/null 2>&1; then
+    routes_ready=false
+  fi
+done
+if [[ "$routes_ready" == true ]]; then
+  echo "Glove route(s) already use ${wuji_interface}; all requested gloves are reachable."
   exit 0
+fi
+if nmcli -g connection.id connection show "$wuji_profile" >/dev/null 2>&1; then
+  nmcli connection delete "$wuji_profile" >/dev/null
 fi
 if ip -4 -o address show dev "$wuji_interface" | grep -q 'inet '; then
   echo "${wuji_interface} already has an IPv4 address from another network profile:" >&2
@@ -49,14 +73,15 @@ if ip -4 -o address show dev "$wuji_interface" | grep -q 'inet '; then
   echo "Disconnect it first (nmcli device disconnect ${wuji_interface}), then rerun this script." >&2
   exit 1
 fi
-if nmcli -g connection.id connection show "$wuji_profile" >/dev/null 2>&1; then
-  nmcli connection delete "$wuji_profile" >/dev/null
-fi
 
 if ip -4 route show 192.168.1.0/24 | grep -q .; then
-  echo "192.168.1.0/24 is already on another interface (likely the Pico Wi-Fi); routing only ${glove_ip} over ${wuji_interface}."
+  route_csv=""
+  for glove_ip in "${glove_ips[@]}"; do
+    route_csv+="${route_csv:+,}${glove_ip}/32"
+  done
+  echo "192.168.1.0/24 is already on another interface (likely the Pico Wi-Fi); routing ${glove_ips[*]} over ${wuji_interface}."
   addresses="${laptop_ip}/32"
-  routes="${glove_ip}/32"
+  routes="$route_csv"
 else
   addresses="${laptop_ip}/24"
   routes=""
@@ -79,9 +104,19 @@ if [[ "$(ip -4 route show default)" != "$wuji_previous_default" ]]; then
   exit 1
 fi
 ip -4 address show dev "$wuji_interface"
-if ping -c 2 -W 1 "$glove_ip" >/dev/null 2>&1; then
-  echo "Glove network ready: ${glove_ip} answers. To remove: nmcli connection delete '${wuji_profile}'"
-else
-  echo "Network configured, but ${glove_ip} does not answer yet. Check glove power, then: ping ${glove_ip}" >&2
+unreachable=()
+for glove_ip in "${glove_ips[@]}"; do
+  if ping -c 2 -W 1 "$glove_ip" >/dev/null 2>&1; then
+    echo "Glove network ready: ${glove_ip} answers."
+  else
+    echo "Network configured, but ${glove_ip} does not answer yet. Check glove power, then: ping ${glove_ip}" >&2
+    unreachable+=("$glove_ip")
+  fi
+done
+echo "To remove: nmcli connection delete '${wuji_profile}'"
+if [[ "$explicit_glove_ips" == true && ${#unreachable[@]} -gt 0 ]]; then
+  exit 1
+fi
+if [[ "$explicit_glove_ips" == false && " ${unreachable[*]} " == *" 192.168.1.100 "* ]]; then
   exit 1
 fi

@@ -9,7 +9,7 @@ cd "$workspace"
 run_tests=1
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "Usage: $0 [--skip-tests]"
-  echo "Needs: git, python3 (3.10-3.12) with venv, curl. Uses PYTHON to pick the interpreter."
+  echo "Needs: git, python3 (3.11-3.12) with venv, curl. Uses PYTHON to pick the interpreter."
   exit 0
 fi
 [[ "${1:-}" == "--skip-tests" ]] && run_tests=0
@@ -18,6 +18,10 @@ step() { printf '\n== %s\n' "$*"; }
 
 step "Checking system tools"
 python_bin="${PYTHON:-}"
+if [[ -z "$python_bin" && -x .venv/bin/python ]] &&
+    .venv/bin/python -c 'import sys; assert (3, 11) <= sys.version_info[:2] <= (3, 12)' 2>/dev/null; then
+  python_bin="$workspace/.venv/bin/python"
+fi
 if [[ -z "$python_bin" ]]; then
   for candidate in python3.11 python3.12 python3.10 python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
@@ -26,8 +30,8 @@ if [[ -z "$python_bin" ]]; then
     fi
   done
 fi
-if [[ -z "$python_bin" ]] || ! "$python_bin" -c 'import sys; assert (3, 10) <= sys.version_info[:2] <= (3, 12)' 2>/dev/null; then
-  echo "Need Python 3.10-3.12 (3.11 is tested). Install it, e.g.: sudo apt install python3.11 python3.11-venv" >&2
+if [[ -z "$python_bin" ]] || ! "$python_bin" -c 'import sys; assert (3, 11) <= sys.version_info[:2] <= (3, 12)' 2>/dev/null; then
+  echo "Need Python 3.11-3.12 (NumPy 2.4 requires >=3.11). Install it, e.g.: sudo apt install python3.11 python3.11-venv" >&2
   exit 1
 fi
 for tool in git curl; do
@@ -75,7 +79,8 @@ test -f third_party/wuji-description/hand2/hand2_beta2/body/mjcf/left.xml
 echo "scene conversion ok"
 if (( run_tests )); then
   .venv/bin/python -m unittest tests.test_vega_arm_sim tests.test_vega_pico_hand \
-    tests.test_vega_pico_wrist tests.test_imu_arm_source tests.test_vr_pose_source
+    tests.test_vega_pico_wrist tests.test_vega_bimanual_sim \
+    tests.test_imu_arm_source tests.test_vr_pose_source
 fi
 
 cat <<EOF
@@ -86,5 +91,6 @@ Setup complete. Next:
   2. No hardware:          scripts/launch_vega_joint_limits.sh
   3. Glove only:           scripts/launch_wuji_vega_hand_only.sh
   4. Glove + Pico:         scripts/launch_wuji_vega_pico_hand.sh
+  5. Both gloves + Pico:   scripts/launch_wuji_vega_bimanual_pico.sh
 See NEW_MACHINE.md for the full walkthrough.
 EOF

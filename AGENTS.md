@@ -15,13 +15,14 @@ Instructions for AI coding assistants working in this repository.
 scripts/setup_sim.sh          # idempotent; ends with "Setup complete" after the tests pass
 ```
 
-It needs `git`, `curl`, and Python 3.10-3.12 with venv (3.11 tested). If it fails on a missing system package, tell the user the `sudo apt install ...` line it printed; do not run sudo yourself.
+It needs `git`, `curl`, and Python 3.11-3.12 with venv. If it fails on a missing system package, tell the user the `sudo apt install ...` line it printed; do not run sudo yourself.
 
 ## Verify
 
 ```bash
 .venv/bin/python -m unittest tests.test_vega_arm_sim tests.test_vega_pico_hand \
-  tests.test_vega_pico_wrist tests.test_imu_arm_source tests.test_vr_pose_source
+  tests.test_vega_pico_wrist tests.test_vega_bimanual_sim \
+  tests.test_imu_arm_source tests.test_vr_pose_source
 .venv/bin/python -m unittest discover -s tests      # full suite; one GUI test is skipped
 ```
 
@@ -39,7 +40,14 @@ Hardware checks:
 
 Launchers are in `scripts/` and listed in `SIM_LAUNCH_COMMANDS.txt` and `NEW_MACHINE.md`. They auto-detect DexStream (`.venv/bin/dexstream` first), the Wi-Fi IP and the glove, and append each run to `SIM_RUN_LOG.txt`. When starting a viewer from a tool shell, set `DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority` and run it in the background. To stop only the sim, kill the `python -m wuji_teleop.vega_arm_sim` process.
 
-The main mode is `scripts/launch_wuji_vega_pico_hand.sh`:
+The bilateral mode is `scripts/launch_wuji_vega_bimanual_pico.sh`:
+
+- Pico left/right hand tracking drives matching simulated arms, joints 1-4.
+- The two glove palm IMUs drive matching wrists, joints 5-7.
+- The two glove skeletons drive matching fingers.
+- The user presses **R** to calibrate both sides.
+
+The single-left mode remains `scripts/launch_wuji_vega_pico_hand.sh`:
 
 - Pico hand tracking (DexStream `--input hand`, topic `vr/hands`) drives arm joints 1-4.
 - The glove palm IMU drives the wrist, joints 5-7.
@@ -54,6 +62,7 @@ The main mode is `scripts/launch_wuji_vega_pico_hand.sh`:
   - IK (`DampedLeastSquaresIK`, `glove_arm_ik`, `pico_upper_ik`, `WristOrientationIK`);
   - `PicoHandArmMapper`;
   - the `run()` loop and the CLI.
+- `wuji_teleop/vega_bimanual_sim.py`: both articulated arms/hands and bilateral run loop.
 - `wuji_teleop/vr_pose_source.py`: Zenoh readers for Pico controllers and hands.
 - `wuji_teleop/imu_arm_source.py`: glove palm IMU to arm or wrist targets.
 - `wuji_teleop/vega_arm_range.py`: Tk joint jog tool.

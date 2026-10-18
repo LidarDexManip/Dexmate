@@ -176,6 +176,25 @@ class PicoHandSourceTests(unittest.TestCase):
         self.assertEqual(self.source.read().received, 1)
         self.assertEqual(self.source.read().frame.received_at, first.received_at)
 
+    def test_right_source_selects_right_wrist(self):
+        session = FakeSession()
+        source = PicoHandPoseSource(side="right", session=session)
+        try:
+            payload = hand_payload()
+            right = np.eye(4)
+            right[:3, 3] = [0.4, -0.2, 1.2]
+            payload["right"]["wrist"] = right.tolist()
+            session.callback(FakeSample(payload))
+            snapshot = source.read()
+            self.assertEqual(snapshot.received, 1)
+            np.testing.assert_allclose(snapshot.frame.pose, right)
+        finally:
+            source.close()
+
+    def test_rejects_invalid_side(self):
+        with self.assertRaisesRegex(ValueError, "side"):
+            PicoHandPoseSource(side="middle", session=FakeSession())
+
 
 if __name__ == "__main__":
     unittest.main()
