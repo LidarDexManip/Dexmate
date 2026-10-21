@@ -57,6 +57,7 @@ The launchers find the Wi-Fi address and DexStream on their own. Override with `
 | Glove fingers + whole arm (IMU) | `scripts/launch_wuji_vega_glove_arm.sh` | glove |
 | **Hand + Pico** (arm from headset, wrist and fingers from glove) | `scripts/launch_wuji_vega_pico_hand.sh` | glove + Pico |
 | **Both hands + Pico** (both arms, wrists, and hands) | `scripts/launch_wuji_vega_bimanual_pico.sh` | two gloves + Pico |
+| **Wrist trackers** (both arms from two PICO Motion Trackers, GMR-style IK; gloves for fingers) | `scripts/launch_wuji_vega_bimanual_trackers.sh` | two trackers + Pico + XRoboToolkit PC Service (+ two gloves) |
 | DexStream only (keeps the Pico page up) | `scripts/launch_dexstream.sh` | Pico |
 
 **Both hands + Pico steps:**

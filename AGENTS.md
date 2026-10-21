@@ -22,7 +22,8 @@ It needs `git`, `curl`, and Python 3.11-3.12 with venv. If it fails on a missing
 ```bash
 .venv/bin/python -m unittest tests.test_vega_arm_sim tests.test_vega_pico_hand \
   tests.test_vega_pico_wrist tests.test_vega_bimanual_sim \
-  tests.test_imu_arm_source tests.test_vr_pose_source
+  tests.test_imu_arm_source tests.test_vr_pose_source \
+  tests.test_gmr_arm_retarget tests.test_xr_tracker_source
 .venv/bin/python -m unittest discover -s tests      # full suite; one GUI test is skipped
 ```
 
@@ -47,6 +48,13 @@ The bilateral mode is `scripts/launch_wuji_vega_bimanual_pico.sh`:
 - The two glove skeletons drive matching fingers.
 - The user presses **R** to calibrate both sides.
 
+The wrist tracker mode is `scripts/launch_wuji_vega_bimanual_trackers.sh` (no DexStream):
+
+- XRoboToolkit object tracking streams one PICO Motion Tracker per wrist through the PC Service (`/opt/apps/roboticsservice`) to `xrobotoolkit_sdk`, built into `.venv` by `scripts/install_xrobotoolkit_sdk.sh`.
+- GMR-style two-stage mink IK maps each 6D wrist pose to all seven joints of the matching arm. The config is `wuji_teleop/ik_configs/xr_trackers_to_vega_1u.json`.
+- The glove skeletons drive the fingers; `FINGER_INPUT=synthetic` runs without gloves, `FINGER_INPUT=left-glove` (or `right-glove`) with one.
+- The first tracker frame calibrates; **R** recalibrates.
+
 The single-left mode remains `scripts/launch_wuji_vega_pico_hand.sh`:
 
 - Pico hand tracking (DexStream `--input hand`, topic `vr/hands`) drives arm joints 1-4.
@@ -64,6 +72,8 @@ The single-left mode remains `scripts/launch_wuji_vega_pico_hand.sh`:
   - the `run()` loop and the CLI.
 - `wuji_teleop/vega_bimanual_sim.py`: both articulated arms/hands and bilateral run loop.
 - `wuji_teleop/vr_pose_source.py`: Zenoh readers for Pico controllers and hands.
+- `wuji_teleop/xr_tracker_source.py`: XRoboToolkit wrist tracker reader, OpenXR to robot frame, left/right assignment.
+- `wuji_teleop/gmr_arm_retarget.py`: GMR-style key-body config, rest-pose offsets, scaling, two-stage mink IK, tracker to arm mapping.
 - `wuji_teleop/imu_arm_source.py`: glove palm IMU to arm or wrist targets.
 - `wuji_teleop/vega_arm_range.py`: Tk joint jog tool.
 - `wuji_teleop/sources.py`: glove connection.

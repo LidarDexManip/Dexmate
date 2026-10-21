@@ -1,3 +1,7 @@
 # Optional Pico arm input for the simulation-only Wuji glove + Vega scene.
 -r requirements-wuji-sim.txt
 eclipse-zenoh==1.10.1
+# Wrist tracker input: GMR-style differential IK (mink with the daqp QP solver).
+mink==1.2.0
+qpsolvers==4.13.0
+daqp==0.10.3

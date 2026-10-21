@@ -281,6 +281,7 @@ This creates `.venv` and installs the pinned packages, DexStream and the Pico pa
 | `scripts/launch_wuji_vega_hand_only.sh` | Hand only: glove drives the fingers, arm fixed | glove |
 | `scripts/launch_wuji_vega_pico_hand.sh` | Hand + Pico: headset hand tracking moves the arm (joints 1-4), the glove turns the wrist (joints 5-7) and drives the fingers | glove + Pico |
 | `scripts/launch_wuji_vega_bimanual_pico.sh` | Bilateral: Pico tracks both hands; two gloves drive matching wrists and fingers | two gloves + Pico |
+| `scripts/launch_wuji_vega_bimanual_trackers.sh` | Wrist trackers: a PICO Motion Tracker on each wrist gives the 6D wrist pose; GMR-style IK moves all 7 joints of each arm; two gloves drive the fingers | two trackers + Pico + XRoboToolkit PC Service (+ two gloves) |
 
 For bilateral use, the gloves normally answer at `192.168.1.100` and `.101`.
 The network helper installs host routes for both when Pico Wi-Fi is on the same
@@ -296,6 +297,24 @@ Close the MuJoCo window or press Ctrl-C to stop. Glove-only wrist and whole-arm 
 3. Hold the glove still for one second so the wrist calibrates.
 4. Wait for the status line to show `hand tracking`.
 5. Hold your hand in a comfortable working position and press **R** in the MuJoCo window.
+
+**Wrist tracker steps** (XRoboToolkit instead of DexStream):
+
+1. Once: install the XRoboToolkit PC Service `.deb`, then run `scripts/install_xrobotoolkit_sdk.sh` (`setup_sim.sh` runs it when the service is installed).
+2. Strap a PICO Motion Tracker on the back of each wrist.
+3. Run `scripts/launch_wuji_vega_bimanual_trackers.sh`. It starts the PC Service if needed.
+4. On the Pico, open XRoboToolkit and connect to the laptop. In the **Pico Motion Tracker** tab, choose object tracking and press **Send**. Without Send, no tracker data arrives.
+5. The first tracker frame calibrates. To recalibrate, hold both forearms forward, palms down, look straight ahead, and press **R**. Both arms return to their mirrored home pose.
+
+How it retargets (GMR, Ze et al. 2025, Section IV), configured in `wuji_teleop/ik_configs/xr_trackers_to_vega_1u.json` (GMR format):
+
+- Key bodies: left/right wrist tracker -> `L_ee`/`R_ee`, with position and orientation costs per IK stage.
+- Rest-pose offsets: **R** sets each wrist's rotation offset and position offset so the current pose maps onto the robot hands at their mirrored home pose. Tracking is relative to that moment. The operator heading comes from the headset.
+- Scaling: wrist motion times `human_scale_table` times `HUMAN_HEIGHT / human_height_assumption`.
+- IK: two mink stages (`ik_match_table1`, then `ik_match_table2`), each repeated while the error falls by more than 1e-3 (at most 10 extra solves), warm-started from the previous frame. Only the 14 arm joints move.
+- Joint limits: every IK step is a QP with hard joint-range bounds. The sim leaves the elbow (`j4`) unlimited, so `joint_limits` in the config adds the URDF elbow range, `[-3.071, 0.244]` rad, for the IK only.
+- Trackers are told apart by position at calibration; set `LEFT_TRACKER_SN`/`RIGHT_TRACKER_SN` to pin them. `FINGER_INPUT=synthetic` runs without gloves.
+- Each run logs targets, IK error and joints to `/tmp/vega-bimanual-tracker-<time>.csv`.
 
 For the bilateral pre-hardware acceptance sequence and report thresholds, see
 [RETARGETING_ACCEPTANCE.md](RETARGETING_ACCEPTANCE.md).

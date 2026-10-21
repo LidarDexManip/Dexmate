@@ -1,13 +1,19 @@
 """Bilateral Vega arm + Hand 2 model and control-loop checks."""
 
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
+import csv
 import io
+from pathlib import Path
+import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import mujoco
 import numpy as np
 
+from wuji_teleop import vega_bimanual_sim
 from wuji_teleop.sources import SyntheticSource
 from wuji_teleop.imu_arm_source import ImuArmSnapshot
 from wuji_teleop.vega_arm_sim import (
@@ -27,6 +33,7 @@ from wuji_teleop.vega_bimanual_sim import (
     run,
 )
 from wuji_teleop.vr_pose_source import WristPoseFrame, WristPoseSnapshot
+from wuji_teleop.xr_tracker_source import TrackerFrame, TrackerSnapshot
 
 
 class _MovingPicoHand:
@@ -46,6 +53,52 @@ class _MovingPicoHand:
             pose[2, 3] += 0.04
         frame = WristPoseFrame(pose, 1.0, time.time_ns(), now)
         return WristPoseSnapshot(frame, self.count, self.count, None)
+
+
+class _MovingTrackers:
+    """Two wrist trackers that start on the robot hands, then move forward."""
+
+    def __init__(self, poses):
+        self.poses = poses
+        self.started = None
+        self.count = 0
+
+    def read(self):
+        now = time.monotonic()
+        if self.started is None:
+            self.started = now
+        self.count += 1
+        poses = {serial: pose.copy() for serial, pose in self.poses.items()}
+        if now - self.started > 0.15:
+            for pose in poses.values():
+                pose[0, 3] += 0.04
+        frame = TrackerFrame(poses, None, self.count, now)
+        return TrackerSnapshot(frame, self.count, self.count, None)
+
+
+class _FakeViewer:
+    """Viewer stand-in that presses ``key`` once ``press_after`` seconds have passed."""
+
+    def __init__(self, on_key, key, press_after):
+        self.on_key, self.key, self.press_after = on_key, key, press_after
+        self.started = time.monotonic()
+        self.opt = SimpleNamespace(geomgroup=np.ones(6), sitegroup=np.ones(6))
+        self.cam = SimpleNamespace(lookat=np.zeros(3), distance=0.0, azimuth=0.0,
+                                   elevation=0.0)
+
+    def lock(self):
+        return nullcontext()
+
+    def is_running(self):
+        return True
+
+    def set_texts(self, texts):
+        pass
+
+    def sync(self):
+        if self.key is not None and time.monotonic() - self.started >= self.press_after:
+            self.on_key(self.key)
+            self.key = None
 
 
 class _NoPoseImu:
@@ -171,6 +224,81 @@ class BimanualModelTests(unittest.TestCase):
         self.assertEqual(
             report.acceptance["thresholds"]["ik_error_p95_m"], 0.02)
         self.assertIn("quantitative_pass", report.acceptance)
+
+    def _trackers_on_hands(self):
+        poses = {}
+        for side, serial in (("left", "SN-L"), ("right", "SN-R")):
+            ee = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, body_names(side)["ee"])
+            pose = np.eye(4)
+            pose[:3, :3] = self.data.xmat[ee].reshape(3, 3)
+            pose[:3, 3] = self.data.xpos[ee]
+            poses[serial] = pose
+        return poses
+
+    def test_tracker_mode_drives_both_arms_through_gmr_ik(self):
+        sources = {side: SyntheticSource(side) for side in SIDES}
+        with redirect_stdout(io.StringIO()):
+            report = run(sources, mode="tracker",
+                         tracker_source=_MovingTrackers(self._trackers_on_hands()),
+                         headless=True, duration=0.8)
+        self.assertEqual(report.mujoco_warnings, 0)
+        for side, serial in (("left", "SN-L"), ("right", "SN-R")):
+            side_report = report.sides[side]
+            self.assertEqual(side_report.arm_status, "tracker tracking")
+            self.assertEqual(side_report.tracker_serial, serial)
+            self.assertGreater(side_report.arm_updates, 10)
+            self.assertLess(side_report.last_ik_error_m, 0.01)
+            self.assertLess(side_report.ik_rotation_error_p95_rad, 0.05)
+            self.assertGreater(max(side_report.arm_joint_peak_delta_rad), 0.01)
+            self.assertIn(side, report.acceptance["sides"])
+
+    def test_tracker_recalibration_returns_both_arms_to_home(self):
+        # The trackers move the arms forward, then R pins that moved pose to home.
+        sources = {side: SyntheticSource(side) for side in SIDES}
+
+        def viewer(model, data, on_key):
+            return nullcontext(_FakeViewer(on_key, ord("R"), press_after=0.6))
+
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "run.csv"
+            with mock.patch.object(vega_bimanual_sim, "passive_viewer", viewer), \
+                    redirect_stdout(io.StringIO()):
+                report = run(sources, mode="tracker",
+                             tracker_source=_MovingTrackers(self._trackers_on_hands()),
+                             duration=1.4, log_csv=str(log))
+            with log.open() as handle:
+                rows = list(csv.DictReader(handle))
+        for side in SIDES:
+            self.assertGreater(max(report.sides[side].arm_joint_peak_delta_rad), 0.01)
+            last = [row for row in rows if row["side"] == side][-1]
+            goal = np.array([float(last[f"j{i}"]) for i in range(1, 8)])
+            np.testing.assert_allclose(goal, self.arms[side].home, atol=0.01)
+
+    def test_tracker_mode_requires_a_tracker_source(self):
+        sources = {side: SyntheticSource(side) for side in SIDES}
+        with self.assertRaisesRegex(ValueError, "tracker source"):
+            run(sources, mode="tracker", headless=True, duration=0.1)
+
+    def test_one_glove_finger_input_makes_the_other_hand_synthetic(self):
+        glove = mock.Mock(serial="WG-L", firmware="1.0.0", address="192.168.1.100:50001")
+        with mock.patch.object(vega_bimanual_sim, "_connect_bilateral_gloves",
+                               return_value={"left": glove}) as connect, \
+                mock.patch.object(vega_bimanual_sim, "run") as run_sim, \
+                mock.patch("wuji_teleop.xr_tracker_source.XRoboToolkitTrackerSource"), \
+                redirect_stdout(io.StringIO()):
+            code = vega_bimanual_sim.main(
+                ["--arm-input", "tracker", "--finger-input", "left-glove",
+                 "--headless", "--duration", "0.1", "--log-csv", "/dev/null"])
+        self.assertEqual(code, 0)
+        self.assertEqual(connect.call_args.kwargs["sides"], ("left",))
+        sources = run_sim.call_args.args[0]
+        self.assertIs(sources["left"], glove)
+        self.assertIsInstance(sources["right"], SyntheticSource)
+
+    def test_one_glove_finger_input_needs_tracker_arms(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            vega_bimanual_sim.main(["--finger-input", "right-glove"])
 
 
 if __name__ == "__main__":

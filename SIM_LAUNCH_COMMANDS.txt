@@ -44,6 +44,17 @@ scripts/launch_wuji_vega_bimanual_pico.sh [WIFI_IP] [LEFT_SERIAL] [RIGHT_SERIAL]
 # Auto-selects exactly one discovered left glove and one right glove when serials are omitted.
 # Press R in MuJoCo to anchor both sides; logs to /tmp/vega-bimanual-pico-<time>.csv.
 
+# --- Bilateral wrist trackers: XRoboToolkit object tracking -> both arms (GMR-style IK); gloves -> fingers ---
+scripts/install_xrobotoolkit_sdk.sh                  # once, after the PC Service .deb (setup_sim.sh runs it)
+scripts/launch_wuji_vega_bimanual_trackers.sh [LEFT_SERIAL] [RIGHT_SERIAL]
+LEFT_TRACKER_SN=PC... RIGHT_TRACKER_SN=PC... HUMAN_HEIGHT=1.70 scripts/launch_wuji_vega_bimanual_trackers.sh
+FINGER_INPUT=synthetic scripts/launch_wuji_vega_bimanual_trackers.sh   # trackers only, no gloves
+FINGER_INPUT=left-glove scripts/launch_wuji_vega_bimanual_trackers.sh  # one glove; right hand synthetic
+#   = .venv/bin/python -m wuji_teleop.vega_bimanual_sim --arm-input tracker \
+#       --report /tmp/vega-bimanual-tracker-live.json [--human-height M] [--ik-config JSON]
+# IK weights/scales: wuji_teleop/ik_configs/xr_trackers_to_vega_1u.json (GMR format).
+# The first frame calibrates; press R in MuJoCo to recalibrate; logs to /tmp/vega-bimanual-tracker-<time>.csv.
+
 # --- Pico controller rotates the wrist only (glove fingers) ---
 scripts/launch_wuji_vega_pico_wrist.sh [WIFI_IP] [SERIAL]
 #   or: scripts/launch_dexstream.sh paddle  in a separate terminal
@@ -64,7 +75,8 @@ scripts/launch_wuji_vega_manual_arm.sh [J1 J2 J3 J4 J5 J6 J7]
 # --- Unit tests ---
 .venv/bin/python -m unittest tests.test_vega_arm_sim tests.test_vega_pico_hand \
   tests.test_vega_pico_wrist tests.test_vega_bimanual_sim \
-  tests.test_imu_arm_source tests.test_vr_pose_source
+  tests.test_imu_arm_source tests.test_vr_pose_source \
+  tests.test_gmr_arm_retarget tests.test_xr_tracker_source
 
 # --- Stop a running sim (kill only the vega_arm_sim process) ---
 # ps -eo pid,cmd | awk '/python -m wuji_teleop.vega_arm/ && !/awk/'

@@ -2,8 +2,10 @@
 
 Both Vega arms and both Wuji Hand 2 models live in one simulation. Pico hand
 tracking supplies relative end-effector positions, while each matching glove
-supplies wrist orientation and finger landmarks. No robot command transport is
-opened by this module.
+supplies wrist orientation and finger landmarks. In tracker mode, a PICO Motion
+Tracker on each wrist (XRoboToolkit object tracking) supplies the full 6D wrist
+pose through GMR-style IK instead. No robot command transport is opened by this
+module.
 """
 
 from __future__ import annotations
@@ -57,6 +59,12 @@ BIMANUAL_CSV_HEADER = (
     "t,side,target_x,target_y,target_z,ee_x,ee_y,ee_z,"
     "pico_x,pico_y,pico_z,filtered_x,filtered_y,filtered_z,"
     "workspace_clipped,j1,j2,j3,j4,j5,j6,j7"
+)
+# target is the filtered GMR target the IK tracks; raw_target is before filtering.
+TRACKER_CSV_HEADER = (
+    "t,side,target_x,target_y,target_z,ee_x,ee_y,ee_z,"
+    "tracker_x,tracker_y,tracker_z,raw_target_x,raw_target_y,raw_target_z,"
+    "ik_rotation_error_deg,j1,j2,j3,j4,j5,j6,j7"
 )
 
 
@@ -282,6 +290,8 @@ class SideReport:
     ik_error_p95_m: float | None = None
     ik_error_max_m: float | None = None
     wrist_saturation_fraction: float = 0.0
+    tracker_serial: str | None = None
+    ik_rotation_error_p95_rad: float | None = None
     pico_outliers: int = 0
     workspace_clips: int = 0
     reacquisitions: int = 0
@@ -301,18 +311,34 @@ class BimanualRunReport:
 
 
 def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
+        tracker_source=None, tracker_serials=None, ik_config=None, human_height=None,
         duration=None, headless=False, report_path=None, pico_scale=0.6,
         log_csv=None):
     """Run two independent input/control paths in one MuJoCo world."""
     if set(sources) != set(SIDES):
         raise ValueError("Bimanual run requires left and right finger sources")
-    if mode not in ("pico", "synthetic"):
-        raise ValueError("Bimanual mode must be 'pico' or 'synthetic'")
+    if mode not in ("pico", "tracker", "synthetic"):
+        raise ValueError("Bimanual mode must be 'pico', 'tracker', or 'synthetic'")
     if mode == "pico" and (set(pose_sources or {}) != set(SIDES) or
                            set(imu_sources or {}) != set(SIDES)):
         raise ValueError("Pico mode requires left and right Pico and palm-IMU sources")
+    if mode == "tracker" and tracker_source is None:
+        raise ValueError("Tracker mode requires an XRoboToolkit tracker source")
 
     model, data, arms, hands = load_bimanual_scene()
+    tracker_mapper = None
+    if mode == "tracker":
+        # mink is only needed for tracker mode.
+        from .gmr_arm_retarget import DEFAULT_IK_CONFIG, GmrArmRetargeter, TrackerArmMapper
+
+        serials = tracker_serials or {}
+        tracker_mapper = TrackerArmMapper(
+            GmrArmRetargeter(model, {side: arm_joint_names(side) for side in SIDES},
+                             ik_config or DEFAULT_IK_CONFIG,
+                             actual_human_height=human_height),
+            left_serial=serials.get("left"), right_serial=serials.get("right"))
+        print("Tracker mode: the first tracker frame calibrates; press R to recalibrate "
+              "while holding both arms like the robot's home pose.", flush=True)
     finger_controllers = {
         side: TrackingController(WujiRetargeter(side), hands[side]) for side in SIDES
     }
@@ -348,6 +374,28 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
 
     joint_slew = {side: arms[side].home.copy() for side in SIDES}
     max_joint_step = 1.5 / 40.0
+    last_calibration_message = None
+
+    def calibrate_trackers(snapshot, now):
+        """Pin the wrist trackers to the mirrored home pose; report each new outcome.
+
+        Pinning to home rather than the current pose keeps an arm that has
+        drifted from carrying that bias into every later calibration.
+        """
+        nonlocal last_calibration_message
+        try:
+            yaw = tracker_mapper.calibrate(
+                snapshot, {side: arms[side].home.copy() for side in SIDES}, now)
+            message = (f"Calibrated trackers {tracker_mapper.serials}; operator heading "
+                       f"{math.degrees(yaw):.0f} deg. Both arms return to home. To "
+                       "recalibrate, hold forearms forward, palms down, and press R.")
+            last_calibration_message = None
+        except ValueError as exc:
+            message = f"Tracker calibration waiting: {exc}"
+            if message == last_calibration_message:
+                return
+            last_calibration_message = message
+        print(message, flush=True)
 
     def command_arm(side, goal):
         arm = arms[side]
@@ -362,8 +410,10 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
         log_path = Path(log_csv)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         csv_file = log_path.open("w", encoding="utf-8")
-        csv_file.write(BIMANUAL_CSV_HEADER + "\n")
-        print(f"Logging bilateral Pico targets to {log_path}", flush=True)
+        csv_file.write((TRACKER_CSV_HEADER if mode == "tracker"
+                        else BIMANUAL_CSV_HEADER) + "\n")
+        print(f"Logging bilateral {'tracker' if mode == 'tracker' else 'Pico'} "
+              f"targets to {log_path}", flush=True)
 
     report = BimanualRunReport(mode)
     for side in SIDES:
@@ -374,6 +424,7 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
     targets = {side: None for side in SIDES}
     errors = {side: None for side in SIDES}
     error_samples = {side: [] for side in SIDES}
+    rotation_error_samples = {side: [] for side in SIDES}
     wrist_saturated = {side: 0 for side in SIDES}
     arm_start = {side: data.qpos[arms[side].qpos_ids].copy() for side in SIDES}
     peaks = {side: np.zeros(7) for side in SIDES}
@@ -424,6 +475,8 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                                 mappers[side].recenter()
                                 imu_sources[side].recenter(current)
                                 arm_status[side] = "calibrating"
+                        if mode == "tracker":
+                            calibrate_trackers(tracker_source.read(), now)
                         recenter_requested = False
                     if now >= next_finger:
                         for side in SIDES:
@@ -437,9 +490,43 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                         next_finger += max(
                             1, int((now - next_finger) / finger_period) + 1) * finger_period
                     if now >= next_arm:
+                        tracker_goals = {}
+                        if mode == "tracker":
+                            tracker_snapshot = tracker_source.read()
+                            if tracker_mapper.serials is None:
+                                calibrate_trackers(tracker_snapshot, now)
+                            tracker_goals = tracker_mapper.update(tracker_snapshot, now)
                         for side in SIDES:
                             arm = arms[side]
                             ee_id = ee_ids[side]
+                            if mode == "tracker":
+                                arm_status[side] = f"tracker {tracker_mapper.status[side]}"
+                                goal = tracker_goals.get(side)
+                                if goal is None:
+                                    continue
+                                goal = np.clip(_limit_joint_goal(goal, arm.target),
+                                               arm.lower, arm.upper)
+                                command_arm(side, goal)
+                                target = tracker_mapper.targets[side]
+                                targets[side] = target[:3, 3].copy()
+                                errors[side], rotation_error = tracker_mapper.errors[side]
+                                error_samples[side].append(errors[side])
+                                rotation_error_samples[side].append(rotation_error)
+                                margin = 0.05
+                                if np.any(goal[4:] <= arm.lower[4:] + margin) or np.any(
+                                        goal[4:] >= arm.upper[4:] - margin):
+                                    wrist_saturated[side] += 1
+                                report.sides[side].arm_updates += 1
+                                tracker = tracker_mapper.tracker_positions[side]
+                                if csv_file is not None and tracker is not None:
+                                    values = (now - started, side, *target[:3, 3],
+                                              *data.xpos[ee_id], *tracker,
+                                              *tracker_mapper.raw_targets[side][:3, 3],
+                                              math.degrees(rotation_error), *goal)
+                                    csv_file.write(
+                                        ",".join(str(v) if isinstance(v, str)
+                                                 else f"{v:.6f}" for v in values) + "\n")
+                                continue
                             if mode == "synthetic":
                                 goal = ik[side].solve(
                                     synthetic_poses[side].read(now - started), seed=arm.target)
@@ -533,6 +620,9 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                                 f"arm {arm_status[side]}")
                         if errors[side] is not None:
                             part += f", IK {errors[side] * 100:.1f} cm"
+                            if rotation_error_samples[side]:
+                                part += (f" "
+                                         f"{math.degrees(rotation_error_samples[side][-1]):.1f} deg")
                         parts.append(part)
                     status_line = " | ".join(parts)
                     print(status_line, flush=True)
@@ -573,6 +663,12 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                 side_report.ik_error_max_m = float(np.max(samples))
                 side_report.wrist_saturation_fraction = (
                     wrist_saturated[side] / len(samples))
+            if rotation_error_samples[side]:
+                side_report.ik_rotation_error_p95_rad = float(
+                    np.percentile(rotation_error_samples[side], 95))
+            if mode == "tracker":
+                side_report.tracker_serial = (tracker_mapper.serials or {}).get(side)
+                side_report.max_target_step_m = tracker_mapper.filters[side].max_step_m
             if mode == "pico":
                 mapper = mappers[side]
                 side_report.pico_outliers = mapper.outlier_count
@@ -580,7 +676,7 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                 side_report.reacquisitions = mapper.reacquisition_count
                 side_report.max_raw_step_m = mapper.max_raw_step_m
                 side_report.max_target_step_m = mapper.max_target_step_m
-        if mode == "pico":
+        if mode in ("pico", "tracker"):
             thresholds = {
                 "ik_error_p95_m": 0.02,
                 "wrist_saturation_fraction": 0.0,
@@ -629,7 +725,7 @@ RIGHT_GLOVE_ADDRESS = "192.168.1.101:50001"
 
 def _connect_bilateral_gloves(left_serial=None, right_serial=None, user_id="",
                               left_address=LEFT_GLOVE_ADDRESS,
-                              right_address=RIGHT_GLOVE_ADDRESS):
+                              right_address=RIGHT_GLOVE_ADDRESS, sides=SIDES):
     import wuji_sdk
 
     wuji_sdk.set_log_level("warn")
@@ -641,6 +737,8 @@ def _connect_bilateral_gloves(left_serial=None, right_serial=None, user_id="",
             ("right", right_serial, right_address),
         )
         for side, serial, address in endpoints:
+            if side not in sides:
+                continue
             source = GloveSource(
                 serial, user_id, sdk=wuji_sdk,
                 device_name=f"wuji_bimanual_glove_{side}", address=address)
@@ -669,6 +767,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic", action="store_true",
                         help="Run bilateral synthetic arms/fingers without hardware")
+    parser.add_argument("--arm-input", choices=("pico-hand", "tracker"), default="pico-hand",
+                        help="pico-hand: DexStream hand tracking plus glove IMU wrists; "
+                             "tracker: XRoboToolkit wrist trackers through GMR-style IK")
+    parser.add_argument("--finger-input",
+                        choices=("glove", "left-glove", "right-glove", "synthetic"),
+                        default="glove",
+                        help="left-glove/right-glove: one live glove, the other hand "
+                             "synthetic (tracker mode)")
+    parser.add_argument("--left-tracker-sn")
+    parser.add_argument("--right-tracker-sn")
+    parser.add_argument("--ik-config", help="GMR ik_configs JSON for tracker mode")
+    parser.add_argument("--human-height", type=_positive_number,
+                        help="Operator height in metres for GMR scaling (tracker mode)")
     parser.add_argument("--left-glove-sn")
     parser.add_argument("--right-glove-sn")
     parser.add_argument("--left-glove-address", default=LEFT_GLOVE_ADDRESS)
@@ -683,12 +794,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.headless and args.duration is None and not args.convert_only:
         parser.error("--headless requires --duration")
+    tracker = args.arm_input == "tracker"
     if args.synthetic and (args.left_glove_sn or args.right_glove_sn or args.user_id):
         parser.error("glove selection applies only to live input")
+    if args.synthetic and (tracker or args.finger_input != "glove"):
+        parser.error("--synthetic already replaces the arm and finger inputs")
+    if args.finger_input != "glove" and not tracker:
+        parser.error("pico-hand arm input needs both gloves for wrist IMUs")
+    if not tracker and (args.left_tracker_sn or args.right_tracker_sn or
+                        args.ik_config or args.human_height):
+        parser.error("tracker serials, --ik-config and --human-height need --arm-input tracker")
     if not args.synthetic and not args.log_csv:
-        args.log_csv = f"/tmp/vega-bimanual-pico-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+        args.log_csv = (f"/tmp/vega-bimanual-{'tracker' if tracker else 'pico'}-"
+                        f"{time.strftime('%Y%m%d-%H%M%S')}.csv")
 
-    sources = pose_sources = imu_sources = None
+    sources = pose_sources = imu_sources = tracker_source = None
     try:
         if args.convert_only:
             model, _, _, _ = load_bimanual_scene()
@@ -699,37 +819,55 @@ def main(argv=None):
             sources = {side: SyntheticSource(side) for side in SIDES}
             mode = "synthetic"
         else:
-            sources = _connect_bilateral_gloves(
-                args.left_glove_sn, args.right_glove_sn, args.user_id,
-                args.left_glove_address, args.right_glove_address)
-            for side in SIDES:
-                source = sources[side]
-                print(f"{side.capitalize()} glove {source.serial}: "
-                      f"firmware={source.firmware}, address={source.address}", flush=True)
-            pose_sources = {side: PicoHandPoseSource(side=side) for side in SIDES}
-            imu_sources = {}
-            for side in SIDES:
-                source = sources[side]
-                imu_sources[side] = PalmImuArmSource(
-                    source.palm_imu_resource(),
-                    estimator=PalmImuRetargeter(
-                        imu_in_wrist_rotation=source.palm_imu_mount_rotation(),
-                        hand_in_ee_rotation=HAND_IN_EE_ROTATION,
-                        motion_mode="orientation"))
-            mode = "pico"
+            if args.finger_input == "synthetic":
+                sources = {side: SyntheticSource(side) for side in SIDES}
+            else:
+                glove_sides = (SIDES if args.finger_input == "glove"
+                               else (args.finger_input.removesuffix("-glove"),))
+                sources = _connect_bilateral_gloves(
+                    args.left_glove_sn, args.right_glove_sn, args.user_id,
+                    args.left_glove_address, args.right_glove_address,
+                    sides=glove_sides)
+                for side in glove_sides:
+                    source = sources[side]
+                    print(f"{side.capitalize()} glove {source.serial}: "
+                          f"firmware={source.firmware}, address={source.address}",
+                          flush=True)
+                for side in SIDES:
+                    sources.setdefault(side, SyntheticSource(side))
+            if tracker:
+                from .xr_tracker_source import XRoboToolkitTrackerSource
+
+                tracker_source = XRoboToolkitTrackerSource()
+                mode = "tracker"
+            else:
+                pose_sources = {side: PicoHandPoseSource(side=side) for side in SIDES}
+                imu_sources = {}
+                for side in SIDES:
+                    source = sources[side]
+                    imu_sources[side] = PalmImuArmSource(
+                        source.palm_imu_resource(),
+                        estimator=PalmImuRetargeter(
+                            imu_in_wrist_rotation=source.palm_imu_mount_rotation(),
+                            hand_in_ee_rotation=HAND_IN_EE_ROTATION,
+                            motion_mode="orientation"))
+                mode = "pico"
         run(sources, mode=mode, pose_sources=pose_sources, imu_sources=imu_sources,
+            tracker_source=tracker_source,
+            tracker_serials={"left": args.left_tracker_sn, "right": args.right_tracker_sn},
+            ik_config=args.ik_config, human_height=args.human_height,
             duration=args.duration, headless=args.headless,
             report_path=args.report, pico_scale=args.pico_scale,
             log_csv=args.log_csv)
         return 0
     except KeyboardInterrupt:
-        print("Stopped; both glove connections closed.", file=sys.stderr)
+        print("Stopped; all input connections closed.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
-        closeables = []
+        closeables = [tracker_source] if tracker_source is not None else []
         for mapping in (imu_sources, pose_sources, sources):
             if mapping:
                 closeables.extend(mapping.values())

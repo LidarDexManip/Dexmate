@@ -67,9 +67,16 @@ else
   echo "Installed three.js ${three_version} without npm."
 fi
 
+step "Building PICO Motion Tracker bindings (XRoboToolkit, optional)"
+if [[ -f /opt/apps/roboticsservice/SDK/include/PXREARobotSDK.h ]]; then
+  scripts/install_xrobotoolkit_sdk.sh
+else
+  echo "XRoboToolkit PC Service not installed; skipping. Only the tracker launcher needs it."
+fi
+
 step "Verifying"
 .venv/bin/python - <<'EOF'
-import mujoco, numpy, wuji_sdk, zenoh, dexstream  # noqa: F401
+import mink, mujoco, numpy, wuji_sdk, zenoh, dexstream  # noqa: F401
 print("imports ok: mujoco", mujoco.__version__)
 EOF
 test -x .venv/bin/dexstream
@@ -80,7 +87,8 @@ echo "scene conversion ok"
 if (( run_tests )); then
   .venv/bin/python -m unittest tests.test_vega_arm_sim tests.test_vega_pico_hand \
     tests.test_vega_pico_wrist tests.test_vega_bimanual_sim \
-    tests.test_imu_arm_source tests.test_vr_pose_source
+    tests.test_imu_arm_source tests.test_vr_pose_source \
+    tests.test_gmr_arm_retarget tests.test_xr_tracker_source
 fi
 
 cat <<EOF
@@ -92,5 +100,6 @@ Setup complete. Next:
   3. Glove only:           scripts/launch_wuji_vega_hand_only.sh
   4. Glove + Pico:         scripts/launch_wuji_vega_pico_hand.sh
   5. Both gloves + Pico:   scripts/launch_wuji_vega_bimanual_pico.sh
+  6. Wrist trackers:       scripts/launch_wuji_vega_bimanual_trackers.sh
 See NEW_MACHINE.md for the full walkthrough.
 EOF
