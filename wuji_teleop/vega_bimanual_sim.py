@@ -153,9 +153,8 @@ def build_bimanual_mjcf(output=BIMANUAL_OUTPUT):
     if base is None or actuators is None:
         raise ValueError("Articulated Vega model is missing base or actuators")
 
-    # The left-only scene keeps the right arm movable but unlimited because it
-    # is merely held as scenery. The bilateral scene applies the same tested
-    # software limits to both sides.
+    # Both arms use the official URDF limits; reapply them to the right arm here
+    # so the bilateral scene stays tied to RIGHT_ARM_JOINT_LIMITS.
     joints = _joint_node_map(base)
     actuator_by_name = {node.get("name"): node for node in actuators}
     for index, (joint_name, actuator_name) in enumerate(

@@ -3,7 +3,9 @@
 from contextlib import redirect_stdout
 import io
 import math
+from pathlib import Path
 import unittest
+import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
@@ -19,6 +21,8 @@ from wuji_teleop.vega_arm_sim import (
     ELBOW_JOINT_INDEX,
     ELBOW_MAX_FLEXION,
     MujocoArm,
+    RIGHT_ARM_JOINT_LIMITS,
+    RIGHT_ARM_JOINT_NAMES,
     SHOULDER_BODY_NAME,
     SyntheticWristPoseSource,
     WristOrientationIK,
@@ -86,26 +90,31 @@ class VegaArmSimulationTests(unittest.TestCase):
         actuator_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
                         for n in ARM_ACTUATOR_NAMES]
         self.assertTrue(np.array_equal(self.model.actuator_trnid[actuator_ids, 0], ids))
-        limited = np.ones(7, dtype=bool)
-        limited[ELBOW_JOINT_INDEX] = False
-        np.testing.assert_array_equal(self.model.jnt_limited[ids].astype(bool), limited)
-        np.testing.assert_array_equal(
-            self.model.actuator_ctrllimited[actuator_ids].astype(bool), limited)
-        self.assertTrue(np.all(np.isinf(ARM_JOINT_LIMITS[ELBOW_JOINT_INDEX])))
-        np.testing.assert_allclose(self.model.jnt_range[ids][limited], ARM_JOINT_LIMITS[limited])
-        np.testing.assert_allclose(self.model.actuator_ctrlrange[actuator_ids][limited],
-                                   ARM_JOINT_LIMITS[limited])
+        self.assertTrue(np.all(self.model.jnt_limited[ids]))
+        self.assertTrue(np.all(self.model.actuator_ctrllimited[actuator_ids]))
+        np.testing.assert_allclose(self.model.jnt_range[ids], ARM_JOINT_LIMITS)
+        np.testing.assert_allclose(self.model.actuator_ctrlrange[actuator_ids], ARM_JOINT_LIMITS)
         self.assertTrue(np.all(ARM_HOME_QPOS >= ARM_JOINT_LIMITS[:, 0]))
         self.assertTrue(np.all(ARM_HOME_QPOS <= ARM_JOINT_LIMITS[:, 1]))
         self.arm.set_target(np.full(7, 5.0))
         ctrl = self.data.ctrl[self.arm.actuator_ids]
-        np.testing.assert_allclose(ctrl[limited], ARM_JOINT_LIMITS[limited, 1])
-        self.assertEqual(ctrl[ELBOW_JOINT_INDEX], 5.0)
+        np.testing.assert_allclose(ctrl, ARM_JOINT_LIMITS[:, 1])
         self.arm.set_target(np.full(7, -5.0))
         ctrl = self.data.ctrl[self.arm.actuator_ids]
-        np.testing.assert_allclose(ctrl[limited], ARM_JOINT_LIMITS[limited, 0])
-        self.assertEqual(ctrl[ELBOW_JOINT_INDEX], -5.0)
+        np.testing.assert_allclose(ctrl, ARM_JOINT_LIMITS[:, 0])
         self.assertEqual((self.model.nq, self.model.nv, self.model.nu), (34, 34, 34))
+
+    def test_both_arms_use_the_official_urdf_limits(self):
+        urdf = ET.parse(Path(__file__).resolve().parents[1] /
+                        "dexmate-urdf/robots/humanoid/vega_1u/vega_1u.urdf").getroot()
+        for names, limits in ((ARM_JOINT_NAMES, ARM_JOINT_LIMITS),
+                              (RIGHT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_LIMITS)):
+            official = np.array([[float(urdf.find(f"joint[@name='{name}']/limit").get(key))
+                                  for key in ("lower", "upper")] for name in names])
+            np.testing.assert_allclose(limits, official, atol=1e-9)
+            ids = [self.model.joint(name).id for name in names]
+            self.assertTrue(np.all(self.model.jnt_limited[ids]))
+            np.testing.assert_allclose(self.model.jnt_range[ids], official, atol=1e-9)
 
     def test_bent_neutral_pose_recruits_shoulder_and_elbow_for_wrist_lift(self):
         np.testing.assert_allclose(self.data.qpos[self.arm.qpos_ids], ARM_HOME_QPOS)
@@ -266,8 +275,8 @@ class VegaArmSimulationTests(unittest.TestCase):
         self.assertAlmostEqual(desired_shoulder_pitch(home, home), ARM_HOME_QPOS[0])
         self.assertAlmostEqual(desired_shoulder_pitch(home + 0.30, home), ARM_HOME_QPOS[0] - 0.30)
         self.assertAlmostEqual(desired_shoulder_pitch(home - 0.30, home), ARM_HOME_QPOS[0] + 0.30)
-        self.assertAlmostEqual(desired_shoulder_pitch(home - 3.0, home), ARM_JOINT_LIMITS[0, 1])
-        self.assertAlmostEqual(desired_shoulder_pitch(home + 3.0, home), ARM_JOINT_LIMITS[0, 0])
+        self.assertAlmostEqual(desired_shoulder_pitch(home - 5.0, home), ARM_JOINT_LIMITS[0, 1])
+        self.assertAlmostEqual(desired_shoulder_pitch(home + 5.0, home), ARM_JOINT_LIMITS[0, 0])
         # A more bent elbow already lifts the hand, so the shoulder backs off.
         home_elbow = ARM_HOME_QPOS[ELBOW_JOINT_INDEX]
         self.assertGreater(desired_shoulder_pitch(home, home, home_elbow - 0.5), ARM_HOME_QPOS[0] + 0.2)

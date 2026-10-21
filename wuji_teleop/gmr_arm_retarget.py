@@ -17,13 +17,12 @@ and its reference code (``general_motion_retargeting/motion_retarget.py``):
 
 Only the arm joints move in the IK; every other joint is frozen. A light posture
 task toward the calibration pose settles each 7-DoF arm's spare elbow swivel.
-Every step is a QP with hard joint-range bounds: the model's ranges plus the
-config's ``joint_limits`` for joints the sim leaves unlimited.
+Every step is a QP with hard bounds at the model's joint ranges, which are the
+official Vega URDF limits.
 """
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 import json
 import math
@@ -106,14 +105,7 @@ def load_ik_config(path=DEFAULT_IK_CONFIG):
         for key_body in table:
             if key_body.human_body not in scales:
                 raise ValueError(f"{key_body.human_body} is matched but has no scale")
-    joint_limits = {}
-    for joint, bounds in config.get("joint_limits", {}).items():
-        bounds = np.asarray(bounds, dtype=np.float64)
-        if bounds.shape != (2,) or not np.isfinite(bounds).all() or bounds[0] >= bounds[1]:
-            raise ValueError(f"joint_limits.{joint} must be [lower, upper] in radians")
-        joint_limits[joint] = bounds
     return {
-        "joint_limits": joint_limits,
         "human_root_name": root,
         "human_height_assumption": height,
         "human_scale_table": {body: float(scale) for body, scale in scales.items()},
@@ -172,18 +164,7 @@ class GmrArmRetargeter:
         for dofs in self.dof_ids.values():
             posture_cost[dofs] = config["posture_cost"]
         self.posture = mink.PostureTask(model, cost=posture_cost)
-        # IK-only ranges from the config (e.g. the URDF elbow limit, which the sim
-        # leaves open) go on a copy, so the simulated physics keep their own limits.
-        limit_model = model
-        if config["joint_limits"]:
-            limit_model = copy.deepcopy(model)
-            for name, bounds in config["joint_limits"].items():
-                joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-                if joint < 0:
-                    raise ValueError(f"joint_limits names {name}, which is not in the model")
-                limit_model.jnt_limited[joint] = 1
-                limit_model.jnt_range[joint] = bounds
-        self.limits = [mink.ConfigurationLimit(limit_model)]
+        self.limits = [mink.ConfigurationLimit(model)]
         self.solver = config["solver"]
         self.damping = config["damping"]
         self.max_iter = int(max_iter)
@@ -193,11 +174,11 @@ class GmrArmRetargeter:
         # their limits so the frozen DoFs cannot make the joint-limit QP infeasible.
         self.neutral_qpos = model.qpos0.copy()
         for joint in range(model.njnt):
-            if limit_model.jnt_limited[joint] and model.jnt_type[joint] in (
+            if model.jnt_limited[joint] and model.jnt_type[joint] in (
                     mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
                 address = model.jnt_qposadr[joint]
                 self.neutral_qpos[address] = np.clip(
-                    self.neutral_qpos[address], *limit_model.jnt_range[joint])
+                    self.neutral_qpos[address], *model.jnt_range[joint])
         self.heading = np.eye(3)
         self.offsets = None
 

@@ -35,16 +35,17 @@ ARM_JOINT_NAMES = tuple(f"L_arm_j{i}" for i in range(1, 8))
 ARM_ACTUATOR_NAMES = tuple(f"{name}_sim_position" for name in ARM_JOINT_NAMES)
 WRIST_JOINT_NAMES = ARM_JOINT_NAMES[4:]
 WRIST_ACTUATOR_NAMES = ARM_ACTUATOR_NAMES[4:]
-# Left arm joint limits (rad), tuned by jogging the sim. Order is L_arm_j1..j7.
-# The elbow (j4) is unlimited, like the right arm.
+# Left arm joint limits (rad), exactly the official ones: dexmate-urdf
+# vega_1u.urdf, which matches the Vega hardware specs at docs.dexmate.ai.
+# Order is L_arm_j1..j7.
 ARM_JOINT_LIMITS = np.array([
-    [-1.40, 2.40],
-    [-0.55, 1.40],
-    [-1.50, 1.50],
-    [-np.inf, np.inf],
-    [-2.00, 1.00],
-    [-0.50, 1.50],
-    [-1.00, 1.00],
+    [-3.071, 3.071],
+    [-0.453, 1.553],
+    [-3.071, 3.071],
+    [-3.071, 0.244],
+    [-3.071, 3.071],
+    [-1.396, 1.396],
+    [-1.378, 1.117],
 ])
 # Bent neutral pose requested for glove calibration. Order is L_arm_j1..j7.
 # Joint 4 is elbow flexion, negative when bent. Must sit inside ARM_JOINT_LIMITS.
@@ -84,7 +85,7 @@ ELBOW_JOINT_INDEX = 3
 # Bending the elbow by e rad swings the hand about -0.59 e rad ahead of the
 # upper arm, seen from the joint 1 anchor (measured by forward kinematics).
 ELBOW_PITCH_COUPLING = 0.59
-# The elbow joint is unlimited; the IK goal never folds it further than this.
+# The IK goal never folds the elbow further than this, short of its -3.071 limit.
 ELBOW_MAX_FLEXION = -2.50
 # Straightest elbow goal. A locked-straight elbow is singular for the IK.
 ELBOW_MIN_FLEXION = -0.20
@@ -186,10 +187,12 @@ def build_articulated_mjcf(output: Path | None = None, *, wrist_only=False) -> P
                 raise ValueError(f"Converted Vega is missing {name}")
             joint_map[name].set("armature", "0.03")
             joint_map[name].set("damping", "2.0")
-            _remove_joint_limits(joint_map[name])
+            low, high = RIGHT_ARM_JOINT_LIMITS[RIGHT_ARM_JOINT_NAMES.index(name)]
+            _set_joint_limits(joint_map[name], low, high)
             ET.SubElement(arm_actuators, "position", name=actuator_name, joint=name,
                           kp="480", kv="48", forcerange="-150 150",
-                          ctrllimited="false", forcelimited="true")
+                          ctrlrange=f"{low:g} {high:g}", ctrllimited="true",
+                          forcelimited="true")
 
     # Attach the unmodified Hand 2 model to the arm end-effector.
     _resolve_hand_meshes(hand_root)

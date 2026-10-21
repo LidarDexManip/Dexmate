@@ -17,10 +17,6 @@
     "L_ee": ["Left_Wrist", 50, 10, [0, 0, 0], [1, 0, 0, 0]],
     "R_ee": ["Right_Wrist", 50, 10, [0, 0, 0], [1, 0, 0, 0]]
   },
-  "joint_limits": {
-    "L_arm_j4": [-3.071, 0.244],
-    "R_arm_j4": [-3.071, 0.244]
-  },
   "posture_cost": 0.01,
   "solver": "daqp",
   "damping": 0.5

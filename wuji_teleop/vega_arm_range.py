@@ -1,8 +1,8 @@
 """Jog the articulated Vega left arm joint by joint. No glove needed.
 
 A small control window has one row per left-arm joint: - and + buttons that
-repeat while held, a slider spanning that joint's sim limit (the URDF range
-for the unlimited elbow), the measured
+repeat while held, a slider spanning that joint's sim limit (the official URDF
+range), the measured
 angle, and the original URDF range for reference. The MuJoCo window shows the
 arm. Both arms start at home. Simulation only; nothing is sent to a robot.
 """
@@ -136,8 +136,8 @@ def main():
             root.after(16, tick)
 
         print("Use the 'Vega left arm jog' window. Hold - or + to jog a joint.", flush=True)
-        print("j1 shoulder pitch (home 0.95), j4 elbow (home -0.70, negative bends, "
-              "unlimited in sim; slider uses the URDF range).", flush=True)
+        print("j1 shoulder pitch, j4 elbow (negative bends). Sliders span the URDF "
+              "limits.", flush=True)
         root.after(16, tick)
         root.mainloop()
 

@@ -312,7 +312,7 @@ How it retargets (GMR, Ze et al. 2025, Section IV), configured in `wuji_teleop/i
 - Rest-pose offsets: **R** sets each wrist's rotation offset and position offset so the current pose maps onto the robot hands at their mirrored home pose. Tracking is relative to that moment. The operator heading comes from the headset.
 - Scaling: wrist motion times `human_scale_table` times `HUMAN_HEIGHT / human_height_assumption`.
 - IK: two mink stages (`ik_match_table1`, then `ik_match_table2`), each repeated while the error falls by more than 1e-3 (at most 10 extra solves), warm-started from the previous frame. Only the 14 arm joints move.
-- Joint limits: every IK step is a QP with hard joint-range bounds. The sim leaves the elbow (`j4`) unlimited, so `joint_limits` in the config adds the URDF elbow range, `[-3.071, 0.244]` rad, for the IK only.
+- Joint limits: every IK step is a QP with hard bounds at the sim's joint ranges, which are the official Vega URDF limits (`ARM_JOINT_LIMITS`).
 - Trackers are told apart by position at calibration; set `LEFT_TRACKER_SN`/`RIGHT_TRACKER_SN` to pin them. `FINGER_INPUT=synthetic` runs without gloves.
 - Each run logs targets, IK error and joints to `/tmp/vega-bimanual-tracker-<time>.csv`.
 

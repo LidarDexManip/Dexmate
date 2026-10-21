@@ -20,6 +20,7 @@ from wuji_teleop.gmr_arm_retarget import (
     WRIST_BODIES,
     load_ik_config,
 )
+from wuji_teleop.vega_arm_sim import RIGHT_ARM_JOINT_LIMITS
 from wuji_teleop.vega_bimanual_sim import SIDES, arm_joint_names, body_names, load_bimanual_scene
 from wuji_teleop.xr_tracker_source import TrackerFrame, TrackerSnapshot, heading_rotation
 
@@ -86,7 +87,6 @@ class GmrArmRetargeterTests(unittest.TestCase):
             "root": ("human_root_name", "Pelvis"),
             "scale": ("human_scale_table", {"Left_Wrist": 1.0}),
             "entry": ("ik_match_table1", {"L_ee": ["Left_Wrist", 50, 5]}),
-            "limits": ("joint_limits", {"L_arm_j4": [0.2, -0.1]}),
         }
         for name, (key, value) in cases.items():
             with self.subTest(name), tempfile.TemporaryDirectory() as folder:
@@ -223,30 +223,18 @@ class GmrArmRetargeterTests(unittest.TestCase):
         self.assertFalse(np.allclose(solution["left"], self.home["left"]))
 
     def test_ik_keeps_the_elbow_out_of_hyperextension(self):
-        # The sim leaves j4 unlimited; the config's URDF range bounds it in the IK only.
-        raw = json.loads(Path(DEFAULT_IK_CONFIG).read_text())
-        upper = raw["joint_limits"]["R_arm_j4"][1]
-        del raw["joint_limits"]
-        for config, limited in ((DEFAULT_IK_CONFIG, True), (load_config_from(raw), False)):
-            with self.subTest(limited=limited):
-                retargeter = self.make(config)
-                retargeter.calibrate(self.rest_pose_human(retargeter), self.home)
-                straight = self.home["right"].copy()
-                straight[3] = 0.1
-                retargeter.sync({"left": self.home["left"], "right": straight})
-                bent_back = straight.copy()
-                bent_back[3] = 0.8
-                human = {"Right_Wrist": self.fk_pose(retargeter, "right", bent_back)}
-                for _ in range(40):
-                    elbow = retargeter.solve(retargeter.targets(human))["right"][3]
-                if limited:
-                    self.assertLessEqual(elbow, upper + 1e-6)
-                else:
-                    self.assertGreater(elbow, 0.7)
-        self.assertFalse(self.model.jnt_limited[self.model.joint("R_arm_j4").id])
-        raw["joint_limits"] = {"R_arm_j9": [-1.0, 1.0]}
-        with self.assertRaisesRegex(ValueError, "R_arm_j9"):
-            GmrArmRetargeter(self.model, self.names, load_config_from(raw))
+        # From a nearly straight elbow, an unbounded IK bends it back to reach this target.
+        retargeter = self.make()
+        retargeter.calibrate(self.rest_pose_human(retargeter), self.home)
+        straight = self.home["right"].copy()
+        straight[3] = 0.1
+        retargeter.sync({"left": self.home["left"], "right": straight})
+        bent_back = straight.copy()
+        bent_back[3] = 0.8
+        human = {"Right_Wrist": self.fk_pose(retargeter, "right", bent_back)}
+        for _ in range(40):
+            elbow = retargeter.solve(retargeter.targets(human))["right"][3]
+        self.assertLessEqual(elbow, RIGHT_ARM_JOINT_LIMITS[3, 1] + 1e-6)
 
     def test_solve_warm_starts_from_previous_frame(self):
         retargeter = self.make()
