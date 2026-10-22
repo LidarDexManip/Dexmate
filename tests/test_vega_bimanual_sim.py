@@ -225,6 +225,27 @@ class BimanualModelTests(unittest.TestCase):
             report.acceptance["thresholds"]["ik_error_p95_m"], 0.02)
         self.assertIn("quantitative_pass", report.acceptance)
 
+    def test_pico_recalibration_returns_both_arms_to_launch_home(self):
+        sources = {side: SyntheticSource(side) for side in SIDES}
+        poses = {side: _MovingPicoHand(side) for side in SIDES}
+        imus = {side: _NoPoseImu() for side in SIDES}
+
+        def viewer(model, data, on_key):
+            return nullcontext(_FakeViewer(on_key, ord("R"), press_after=0.6))
+
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "run.csv"
+            with mock.patch.object(vega_bimanual_sim, "passive_viewer", viewer), \
+                    redirect_stdout(io.StringIO()):
+                run(sources, mode="pico", pose_sources=poses, imu_sources=imus,
+                    duration=1.2, log_csv=str(log))
+            with log.open() as handle:
+                rows = list(csv.DictReader(handle))
+        for side in SIDES:
+            last = [row for row in rows if row["side"] == side][-1]
+            goal = np.array([float(last[f"j{i}"]) for i in range(1, 8)])
+            np.testing.assert_allclose(goal, self.arms[side].home, atol=0.01)
+
     def _trackers_on_hands(self):
         poses = {}
         for side, serial in (("left", "SN-L"), ("right", "SN-R")):

@@ -952,7 +952,7 @@ class PicoHandArmMapper:
 
 
 def relative_wrist_rotation(tracked_rotation, calibration_rotation,
-                            neutral_rotation, gain=0.50):
+                            neutral_rotation, gain=0.70):
     """Apply the glove's calibrated relative rotation to the current arm pose.
 
     The upper-arm IK is free to change the end-effector's neutral world

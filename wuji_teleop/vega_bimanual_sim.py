@@ -224,10 +224,10 @@ def _side_ik(model, data, arm, *, upper_only):
     names = body_names(arm.side)
     return DampedLeastSquaresIK(
         model, data, arm,
-        max_step=0.12,
+        max_step=0.15,
         iterations=40 if upper_only else 16,
         orientation_weight=0.0 if upper_only else 0.35,
-        elbow_weight=0.10 if upper_only else 0.20,
+        elbow_weight=0.20 if upper_only else 0.25,
         elbow_down_weight=0.06 if upper_only else 0.12,
         position_weight=4.0 if upper_only else 1.5,
         shoulder_weight=0.0,
@@ -351,7 +351,7 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
     wrist_ik = {
         side: WristOrientationIK(
             model, data, arms[side], joint_indices=(4, 5, 6),
-            max_total_step=0.15, joint_limit_margin=0.08,
+            max_total_step=0.20, joint_limit_margin=0.08,
             ee_body_name=names[side]["ee"])
         for side in SIDES
     }
@@ -420,6 +420,7 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
     snapshots = {side: SourceSnapshot(None, 0, 0, None) for side in SIDES}
     arm_status = {side: ("synthetic" if mode == "synthetic" else "waiting")
                   for side in SIDES}
+    pico_home_hold = {side: False for side in SIDES}
     targets = {side: None for side in SIDES}
     errors = {side: None for side in SIDES}
     error_samples = {side: [] for side in SIDES}
@@ -463,16 +464,22 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                 with viewer.lock() if viewer else nullcontext():
                     if recenter_requested:
                         for side in SIDES:
+                            arm = arms[side]
+                            joint_slew[side][:] = arm.home
+                            wrist_references[side][:] = arm.home[4:]
+                            data.qpos[arm.qpos_ids] = arm.home
+                            data.qvel[arm.dof_ids] = 0.0
+                            arm.set_target(arm.home)
+                        mujoco.mj_forward(model, data)
+                        for side in SIDES:
                             current = np.eye(4)
                             current[:3, :3] = data.xmat[ee_ids[side]].reshape(3, 3)
                             current[:3, 3] = data.xpos[ee_ids[side]]
                             origins[side] = current
-                            joint_slew[side][:] = data.qpos[arms[side].qpos_ids]
-                            wrist_references[side][:] = joint_slew[side][4:]
-                            arms[side].set_target(joint_slew[side])
                             if mode == "pico":
                                 mappers[side].recenter()
                                 imu_sources[side].recenter(current)
+                                pico_home_hold[side] = True
                                 arm_status[side] = "calibrating"
                         if mode == "tracker":
                             calibrate_trackers(tracker_source.read(), now)
@@ -550,6 +557,22 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                             imu_snapshot = imu_sources[side].read(origins[side], now=now)
                             wrist_rotation = (None if imu_snapshot.pose is None
                                               else imu_snapshot.pose[:3, :3])
+                            if pico_home_hold[side]:
+                                position_moved = (
+                                    mappers[side].filtered_hand_position is not None and
+                                    mappers[side].hand_origin is not None and
+                                    np.linalg.norm(
+                                        mappers[side].filtered_hand_position -
+                                        mappers[side].hand_origin) >
+                                    mappers[side].deadband_m)
+                                wrist_moved = False
+                                if wrist_rotation is not None:
+                                    relative = wrist_rotation @ origins[side][:3, :3].T
+                                    angle = math.acos(float(np.clip(
+                                        (np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)))
+                                    wrist_moved = angle > math.radians(2.0)
+                                if position_moved or wrist_moved:
+                                    pico_home_hold[side] = False
                             if target is not None:
                                 target_pose = np.eye(4)
                                 target_pose[:3, :3] = data.xmat[ee_id].reshape(3, 3)
@@ -570,6 +593,8 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                                     # translation; correct position once more
                                     # while preserving the solved wrist joints.
                                     goal = ik[side].solve(target_pose, seed=goal)
+                                if pico_home_hold[side]:
+                                    goal = arm.home.copy()
                                 goal = _limit_joint_goal(goal, arm.target)
                                 goal = np.clip(goal, arm.lower, arm.upper)
                                 command_arm(side, goal)
@@ -630,7 +655,7 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                     next_status = now + 2
                 if viewer and now >= next_viewer:
                     viewer.set_texts((None, None,
-                                      "Vega bilateral + Wuji Hand 2 — R: recenter",
+                                      "Vega bilateral + Wuji Hand 2 — R: home + recalibrate",
                                       status_line))
                     viewer.sync()
                     next_viewer = now + viewer_period

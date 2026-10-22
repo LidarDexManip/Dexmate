@@ -22,7 +22,7 @@ log_run "$@"
 
 echo "Starting bilateral simulation and Pico page https://${wifi_ip}:8091/"
 echo "On the Pico: accept the certificate, put both controllers down, enter AR, and keep both hands visible."
-echo "Hold both gloves still for one second, then press R in MuJoCo to anchor both hands."
+echo "Hold both gloves still for one second, then press R to return both arms home and calibrate."
 echo "Pico positions drive both shoulders/elbows; glove IMUs drive wrists; glove skeletons drive fingers."
 
 if ss -ltn 2>/dev/null | grep -qE ':8091([[:space:]]|$)'; then
