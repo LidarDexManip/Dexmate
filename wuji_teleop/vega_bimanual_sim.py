@@ -65,6 +65,12 @@ TRACKER_CSV_HEADER = (
     "t,side,target_x,target_y,target_z,ee_x,ee_y,ee_z,"
     "tracker_x,tracker_y,tracker_z,raw_target_x,raw_target_y,raw_target_z,"
     "ik_rotation_error_deg,j1,j2,j3,j4,j5,j6,j7"
+    "," + ",".join(
+        [f"{frame}_r{i}{j}" for frame in ("raw_target", "target", "ee")
+         for i in range(3) for j in range(3)]
+        + [f"ik_j{i}" for i in range(1, 8)]
+        + [f"actual_j{i}" for i in range(1, 8)]
+        + [f"elbow_{axis}" for axis in "xyz"])
 )
 
 
@@ -510,6 +516,7 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                                 goal = tracker_goals.get(side)
                                 if goal is None:
                                     continue
+                                ik_goal = goal.copy()
                                 goal = np.clip(_limit_joint_goal(goal, arm.target),
                                                arm.lower, arm.upper)
                                 command_arm(side, goal)
@@ -528,7 +535,14 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                                     values = (now - started, side, *target[:3, 3],
                                               *data.xpos[ee_id], *tracker,
                                               *tracker_mapper.raw_targets[side][:3, 3],
-                                              math.degrees(rotation_error), *goal)
+                                              math.degrees(rotation_error), *goal,
+                                              *tracker_mapper.raw_targets[side][:3, :3].ravel(),
+                                              *target[:3, :3].ravel(),
+                                              *data.xmat[ee_id].ravel(),
+                                              *ik_goal, *data.qpos[arm.qpos_ids],
+                                              *data.xpos[mujoco.mj_name2id(
+                                                  model, mujoco.mjtObj.mjOBJ_BODY,
+                                                  body_names(side)["elbow"])])
                                     csv_file.write(
                                         ",".join(str(v) if isinstance(v, str)
                                                  else f"{v:.6f}" for v in values) + "\n")

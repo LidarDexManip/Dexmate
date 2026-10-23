@@ -155,10 +155,21 @@ class TrackerSourceTests(unittest.TestCase):
         bad = self.source.read()
         self.assertIn("normalized", bad.error)
         self.assertIs(bad.frame, good.frame)
-        self.sdk.serials = ["L", "L"]
+        self.sdk.serials = ["L", ""]
         self.sdk.poses = [_xr_pose([0, 1, 0]), _xr_pose([0, 1, 0])]
         self.sdk.timestamp = 3
-        self.assertIn("repeated", self.source.read().error)
+        self.assertIn("missing", self.source.read().error)
+
+    def test_repeated_serial_keeps_the_entry_that_is_still_updating(self):
+        # The PC service can list a stopped tracker as a frozen copy of a serial.
+        self.sdk.serials = ["L", "R", "R"]
+        frozen = _xr_pose([0.5, 1.0, -0.3])
+        self.sdk.poses = [_xr_pose([-0.2, 1.0, -0.3]), frozen, _xr_pose([0.2, 1.0, -0.3])]
+        self.assertEqual(sorted(self.source.read().frame.poses), ["L", "R"])
+        self.assertEqual(self.source.stale_duplicates, 1)
+        self.sdk.poses = [_xr_pose([-0.2, 1.0, -0.31]), frozen, _xr_pose([0.2, 1.0, -0.32])]
+        frame = self.source.read().frame
+        np.testing.assert_allclose(frame.poses["R"][:3, 3], [0.32, -0.2, 1.0])
 
 
 if __name__ == "__main__":

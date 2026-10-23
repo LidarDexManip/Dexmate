@@ -81,6 +81,28 @@ class GmrArmRetargeterTests(unittest.TestCase):
         raw = json.loads(Path(DEFAULT_IK_CONFIG).read_text())
         self.assertEqual(raw["ik_match_table1"]["L_ee"][0], "Left_Wrist")
 
+    def test_decoupled_wrist_rotation_does_not_move_upper_arm(self):
+        config = Path(DEFAULT_IK_CONFIG).with_name("xr_trackers_to_vega_1u_decoupled.json")
+        baseline, rotating = self.make(config), self.make(config)
+        for solver in (baseline, rotating):
+            solver.calibrate(self.rest_pose_human(solver), self.home)
+        poses = self.ee_poses(baseline)
+        for angle in np.linspace(-0.8, 0.8, 25):
+            fixed, turned = {}, {}
+            for side in SIDES:
+                body = body_names(side)["ee"]
+                pose = poses[side].copy()
+                pose[:3, 3] += [0.01 * math.sin(angle), 0, 0.01]
+                fixed[body] = pose
+                turned[body] = pose.copy()
+                turned[body][:3, :3] = pose[:3, :3] @ Rotation.from_rotvec([angle, 0, 0]).as_matrix()
+            a, b = baseline.solve(fixed), rotating.solve(turned)
+            for side in SIDES:
+                np.testing.assert_allclose(a[side][:4], b[side][:4], atol=1e-8)
+                self.assertTrue(np.isfinite(b[side]).all())
+                self.assertTrue(np.all(b[side] >= self.arms[side].lower - 1e-8))
+                self.assertTrue(np.all(b[side] <= self.arms[side].upper + 1e-8))
+
     def test_invalid_configs_are_rejected(self):
         raw = json.loads(Path(DEFAULT_IK_CONFIG).read_text())
         cases = {

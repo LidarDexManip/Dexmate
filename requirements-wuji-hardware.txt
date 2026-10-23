@@ -1,0 +1,4 @@
+# Physical Vega-1U control from the laptop (scripts/launch_wuji_vega_hardware_pico.sh).
+-r requirements-wuji-vr-sim.txt
+# Keep dexcontrol at the Jetson's version so both use the same robot API.
+dexcontrol==0.5.0

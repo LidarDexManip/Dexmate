@@ -142,6 +142,7 @@ class XRoboToolkitTrackerSource:
         self._last_timestamp_ns = 0
         self._last_raw = None
         self._closed = False
+        self.stale_duplicates = 0
         sdk.init()
 
     def read(self):
@@ -167,9 +168,10 @@ class XRoboToolkitTrackerSource:
                 return  # same or older frame must not refresh the watchdog
         elif self._last_raw is not None and np.array_equal(raw, self._last_raw):
             return
-        if len(set(serials)) != count or "" in serials:
-            raise ValueError("Tracker serial numbers are missing or repeated")
-        poses = {serial: xr_pose_to_robot(pose) for serial, pose in zip(serials, raw)}
+        if "" in serials:
+            raise ValueError("Tracker serial numbers are missing")
+        live = self._live_entries(serials, raw)
+        poses = {serial: xr_pose_to_robot(raw[index]) for serial, index in live.items()}
         headset_raw = np.asarray(sdk.get_headset_pose(), dtype=np.float64)
         headset = (None if headset_raw.shape != (7,) or not np.any(headset_raw[3:])
                    else xr_pose_to_robot(headset_raw))
@@ -179,6 +181,25 @@ class XRoboToolkitTrackerSource:
         self._error = None
         self._revision += 1
         self._received += 1
+
+    def _live_entries(self, serials, raw):
+        """``{serial: row}``; a repeated serial keeps the row that is updating.
+
+        The PC service can keep listing trackers that stopped streaming under a
+        serial it repeats; those rows never change. ``stale_duplicates`` counts
+        the rows dropped.
+        """
+        def changed(index):
+            last = self._last_raw
+            return last is None or last.shape != raw.shape or not np.array_equal(
+                last[index], raw[index])
+
+        chosen = {}
+        for index, serial in enumerate(serials):
+            if serial not in chosen or (changed(index) and not changed(chosen[serial])):
+                chosen[serial] = index
+        self.stale_duplicates = len(serials) - len(chosen)
+        return chosen
 
     def close(self):
         if self._closed:

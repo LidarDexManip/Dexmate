@@ -50,7 +50,7 @@ python_cmd=(
 [[ -n "${LEFT_TRACKER_SN:-}" ]] && python_cmd+=(--left-tracker-sn "$LEFT_TRACKER_SN")
 [[ -n "${RIGHT_TRACKER_SN:-}" ]] && python_cmd+=(--right-tracker-sn "$RIGHT_TRACKER_SN")
 [[ -n "${HUMAN_HEIGHT:-}" ]] && python_cmd+=(--human-height "$HUMAN_HEIGHT")
-[[ -n "${IK_CONFIG:-}" ]] && python_cmd+=(--ik-config "$IK_CONFIG")
+python_cmd+=(--ik-config "${IK_CONFIG:-$workspace/wuji_teleop/ik_configs/xr_trackers_to_vega_1u_decoupled.json}")
 [[ -n "${FINGER_INPUT:-}" ]] && python_cmd+=(--finger-input "$FINGER_INPUT")
 log_cmd python "${python_cmd[@]}"
 "${python_cmd[@]}"

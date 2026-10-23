@@ -111,6 +111,7 @@ def load_ik_config(path=DEFAULT_IK_CONFIG):
         "human_scale_table": {body: float(scale) for body, scale in scales.items()},
         "tables": tables,
         "posture_cost": config.get("posture_cost", 1e-2),
+        "decouple_wrist": bool(config.get("decouple_wrist", False)),
         "solver": config.get("solver", "daqp"),
         "damping": float(config.get("damping", 0.5)),
     }
@@ -164,6 +165,14 @@ class GmrArmRetargeter:
         for dofs in self.dof_ids.values():
             posture_cost[dofs] = config["posture_cost"]
         self.posture = mink.PostureTask(model, cost=posture_cost)
+        self.decouple_wrist = config["decouple_wrist"]
+        self.position_tasks = {body: mink.FrameTask(
+            body, "body", position_cost=key.position_cost, orientation_cost=0.0,
+            lm_damping=1.0) for body, key in self.key_bodies.items()}
+        self.rotation_tasks = {body: mink.FrameTask(
+            body, "body", position_cost=0.0, orientation_cost=key.orientation_cost,
+            lm_damping=1.0) for body, key in self.key_bodies.items()}
+        self.calibration_wrists = None
         self.limits = [mink.ConfigurationLimit(model)]
         self.solver = config["solver"]
         self.damping = config["damping"]
@@ -221,6 +230,8 @@ class GmrArmRetargeter:
         if missing:
             raise ValueError(f"Cannot calibrate without {', '.join(missing)}")
         self.sync(arm_targets)
+        self.calibration_wrists = {
+            side: np.asarray(q)[4:].copy() for side, q in arm_targets.items()}
         self.posture.set_target_from_configuration(self.configuration)
         self.heading = heading_rotation(yaw)
         frames = self._human_frames(human, root)
@@ -276,6 +287,8 @@ class GmrArmRetargeter:
         Arms without a target stay frozen at their previous solution.
         """
         sides = {self.side_of[body] for body in targets}
+        if self.decouple_wrist:
+            return self._solve_decoupled(targets, sides)
         free = set()
         for side in sides:
             free.update(int(dof) for dof in self.dof_ids[side])
@@ -291,6 +304,44 @@ class GmrArmRetargeter:
                 self._solve_stage(active, constraints)
         q = self.configuration.q
         return {side: q[self.qpos_ids[side]].copy() for side in sides}
+
+    def _solve_decoupled(self, targets, sides):
+        """Use a neutral-wrist virtual arm for position, then rotate the wrist.
+
+        Keeping the position solve independent of wrist orientation prevents
+        wrist motion (and its palm offset) feeding back into the elbow solver.
+        The actual palm may move around the wrist pivot during rotation.
+        """
+        if self.calibration_wrists is None:
+            raise RuntimeError("Calibrate before decoupled wrist solving")
+        q = self.configuration.q.copy()
+        wrists = {s: q[self.qpos_ids[s][4:]].copy() for s in sides}
+        for side in sides:
+            q[self.qpos_ids[side][4:]] = self.calibration_wrists[side]
+        self.configuration.update(q)
+        for task_map, joint_slice in ((self.position_tasks, slice(0, 4)),
+                                      (self.rotation_tasks, slice(4, 7))):
+            if task_map is self.rotation_tasks:
+                q = self.configuration.q.copy()
+                for side in sides:
+                    q[self.qpos_ids[side][4:]] = wrists[side]
+                self.configuration.update(q)
+            free = {int(d) for s in sides for d in self.dof_ids[s][joint_slice]}
+            constraints = [mink.DofFreezingTask(
+                self.model, dof_indices=[d for d in range(self.model.nv) if d not in free])]
+            tasks = []
+            for body, target in targets.items():
+                task = task_map[body]
+                stage_target = target.copy()
+                if task_map is self.position_tasks:
+                    # _error also reads unweighted orientation residuals;
+                    # keep those independent of the operator's wrist turn.
+                    stage_target[:3, :3] = np.eye(3)
+                task.set_target(mink.SE3.from_matrix(stage_target))
+                tasks.append(task)
+            if tasks:
+                self._solve_stage(tasks, constraints)
+        return {s: self.configuration.q[self.qpos_ids[s]].copy() for s in sides}
 
     def errors(self, targets):
         """``{robot_body: (position m, rotation rad)}`` of the current IK solution."""
