@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import time
 from pathlib import Path
 
 import mink
@@ -114,6 +115,8 @@ def load_ik_config(path=DEFAULT_IK_CONFIG):
         "decouple_wrist": bool(config.get("decouple_wrist", False)),
         "solver": config.get("solver", "daqp"),
         "damping": float(config.get("damping", 0.5)),
+        "elbow_preference": config.get("elbow_preference", {}),
+        "tracker_mount_height_m": config.get("tracker_mount_height_m", {}),
     }
 
 
@@ -135,6 +138,15 @@ class GmrArmRetargeter:
             ratio = actual_human_height / config["human_height_assumption"]
         self.scales = {body: scale * ratio for body, scale in config["human_scale_table"].items()}
         self.root_body = config["human_root_name"]
+        # Height above the wrist centre with forearms level and palms down.
+        # Calibration converts world-down into each tracker's local axes.
+        self.tracker_mount_heights = config.get("tracker_mount_height_m", {})
+        if (not isinstance(self.tracker_mount_heights, dict) or
+                any(side not in SIDES or not math.isfinite(float(height)) or
+                    not 0 <= float(height) <= 0.20
+                    for side, height in self.tracker_mount_heights.items())):
+            raise ValueError("tracker_mount_height_m must map left/right to heights in [0, 0.20] metres")
+        self.tracker_center_offsets = {}
         self.tables = config["tables"]
         # Targets come from the first enabled table's offsets for both stages, as in GMR.
         self.key_bodies = {key_body.robot_body: key_body for key_body in self.tables[0]}
@@ -179,6 +191,29 @@ class GmrArmRetargeter:
         self.max_iter = int(max_iter)
         self.tolerance = float(tolerance)
         self.configuration = mink.Configuration(model)
+        self.elbow_specs = config.get("elbow_preference", {})
+        self.elbow_tasks = {}
+        self.elbow_rest = {}
+        if self.elbow_specs and self.decouple_wrist:
+            raise ValueError("elbow_preference requires coupled IK")
+        for side, spec in self.elbow_specs.items():
+            if side not in self.qpos_ids:
+                raise ValueError(f"Unknown elbow side: {side}")
+            cost = float(spec["cost"])
+            if not math.isfinite(cost) or cost <= 0:
+                raise ValueError("Elbow cost must be positive and finite")
+            offset = float(spec.get("inward_offset_m", 0.0))
+            blend_distance = float(spec.get("inward_blend_distance_m", 0.10))
+            if not math.isfinite(offset) or offset < 0:
+                raise ValueError("inward_offset_m must be finite and nonnegative")
+            if not math.isfinite(blend_distance) or blend_distance <= 0:
+                raise ValueError("inward_blend_distance_m must be positive and finite")
+            for name in (spec["body"], spec["shoulder"]):
+                if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name) < 0:
+                    raise ValueError(f"Elbow preference body {name} is missing")
+            self.elbow_tasks[side] = mink.FrameTask(
+                spec["body"], "body", position_cost=cost,
+                orientation_cost=0.0, lm_damping=1.0)
         # Joints other than the arms never reach the wrist frames. Park them inside
         # their limits so the frozen DoFs cannot make the joint-limit QP infeasible.
         self.neutral_qpos = model.qpos0.copy()
@@ -190,6 +225,9 @@ class GmrArmRetargeter:
                     self.neutral_qpos[address], *model.jnt_range[joint])
         self.heading = np.eye(3)
         self.offsets = None
+        # Per-solve diagnostics are intentionally kept in memory so replay tools
+        # can inspect the solver without changing the returned joint goals.
+        self.last_diagnostics = {"stages": [], "solve_time_s": 0.0}
 
     @property
     def calibrated(self):
@@ -215,7 +253,10 @@ class GmrArmRetargeter:
             pose = np.asarray(pose, dtype=np.float64)
             frame = np.eye(4)
             frame[:3, :3] = self.heading.T @ pose[:3, :3]
-            frame[:3, 3] = self.heading.T @ (pose[:3, 3] - origin)
+            center = pose[:3, 3]
+            if body in self.tracker_center_offsets:
+                center = center + pose[:3, :3] @ self.tracker_center_offsets[body]
+            frame[:3, 3] = self.heading.T @ (center - origin)
             frames[body] = frame
         return frames
 
@@ -234,6 +275,11 @@ class GmrArmRetargeter:
             side: np.asarray(q)[4:].copy() for side, q in arm_targets.items()}
         self.posture.set_target_from_configuration(self.configuration)
         self.heading = heading_rotation(yaw)
+        self.tracker_center_offsets = {
+            WRIST_BODIES[side]: np.asarray(human[WRIST_BODIES[side]])[:3, :3].T @
+            np.array([0.0, 0.0, -float(height)])
+            for side, height in self.tracker_mount_heights.items() if float(height) > 0
+        }
         frames = self._human_frames(human, root)
         offsets = {}
         for robot_body, key_body in self.key_bodies.items():
@@ -245,6 +291,50 @@ class GmrArmRetargeter:
                       robot[:3, :3] @ key_body.position_offset)
             offsets[robot_body] = (rotation_offset, robot[:3, 3] - scaled)
         self.offsets = offsets
+        self.elbow_rest = {}
+        for side, spec in self.elbow_specs.items():
+            elbow = self.configuration.get_transform_frame_to_world(
+                spec["body"], "body").translation().copy()
+            shoulder = self.configuration.get_transform_frame_to_world(
+                spec["shoulder"], "body").translation().copy()
+            body = next(b for b, s in self.side_of.items() if s == side)
+            wrist = self.configuration.get_transform_frame_to_world(
+                body, "body").translation().copy()
+            self.elbow_rest[side] = (elbow, shoulder, wrist)
+
+    def _elbow_preferences(self, targets):
+        """Soft calibrated elbow prior, independent of wrist orientation.
+
+        Follow half the wrist translation to allow reaching. Fade near the
+        approximate shoulder-elbow-palm reach boundary. This is a weighted
+        competing task, not a strict null-space constraint or collision guard.
+        """
+        active = []
+        for body, target in targets.items():
+            side = self.side_of[body]
+            if side not in self.elbow_tasks:
+                continue
+            elbow, shoulder, wrist = self.elbow_rest[side]
+            reach = np.linalg.norm(elbow - shoulder) + np.linalg.norm(wrist - elbow)
+            distance = np.linalg.norm(target[:3, 3] - shoulder)
+            fade = float(np.clip((reach - distance) / max(0.2 * reach, 1e-6), 0, 1))
+            task = self.elbow_tasks[side]
+            task.set_position_cost(float(self.elbow_specs[side]["cost"]) * fade)
+            pose = np.eye(4)
+            pose[:3, 3] = elbow + 0.5 * (target[:3, 3] - wrist)
+            # Robot x is forward. Retraction from the calibrated palm position
+            # activates a smooth, bounded shift toward the torso centreline.
+            # Orientation alone and forward reaches never activate this offset.
+            spec = self.elbow_specs[side]
+            fraction = float(np.clip((wrist[0] - target[0, 3]) /
+                                    float(spec.get("inward_blend_distance_m", 0.10)), 0, 1))
+            blend = fraction * fraction * (3.0 - 2.0 * fraction)
+            offset = float(spec.get("inward_offset_m", 0.0)) * blend
+            # Clamp at y=0 so the offset itself cannot cross the centreline.
+            pose[1, 3] -= np.sign(pose[1, 3]) * min(offset, abs(pose[1, 3]))
+            task.set_target(mink.SE3.from_matrix(pose))
+            active.append(task)
+        return active
 
     def targets(self, human, root=None):
         """GMR steps 2-3: robot-frame 4x4 targets for each matched body in ``human``."""
@@ -268,18 +358,26 @@ class GmrArmRetargeter:
         return float(np.linalg.norm(np.concatenate(
             [task.compute_error(self.configuration) for task in tasks])))
 
-    def _solve_stage(self, tasks, constraints):
+    def _solve_stage(self, tasks, constraints, preferences=()):
         dt = self.model.opt.timestep
         error = self._error(tasks)
+        initial_error = error
+        iterations = 0
         for _ in range(self.max_iter + 1):
-            velocity = mink.solve_ik(self.configuration, [*tasks, self.posture], dt,
+            velocity = mink.solve_ik(self.configuration, [*tasks, *preferences, self.posture], dt,
                                      self.solver, damping=self.damping,
                                      limits=self.limits, constraints=constraints)
             self.configuration.integrate_inplace(velocity, dt)
             new_error = self._error(tasks)
+            iterations += 1
             if error - new_error <= self.tolerance:
                 break
             error = new_error
+        self.last_diagnostics["stages"].append({
+            "initial_error": float(initial_error),
+            "final_error": float(new_error),
+            "iterations": iterations,
+        })
 
     def solve(self, targets):
         """GMR steps 4-5 toward ``{robot_body: 4x4}``; return ``{side: 7 joints}``.
@@ -287,13 +385,18 @@ class GmrArmRetargeter:
         Arms without a target stay frozen at their previous solution.
         """
         sides = {self.side_of[body] for body in targets}
+        self.last_diagnostics = {"stages": [], "solve_time_s": 0.0}
+        started = time.perf_counter()
         if self.decouple_wrist:
-            return self._solve_decoupled(targets, sides)
+            result = self._solve_decoupled(targets, sides)
+            self.last_diagnostics["solve_time_s"] = time.perf_counter() - started
+            return result
         free = set()
         for side in sides:
             free.update(int(dof) for dof in self.dof_ids[side])
         frozen = [dof for dof in range(self.model.nv) if dof not in free]
         constraints = [mink.DofFreezingTask(self.model, dof_indices=frozen)] if frozen else []
+        preferences = self._elbow_preferences(targets)
         for table, tasks in zip(self.tables, self.tasks):
             active = []
             for key_body, task in zip(table, tasks):
@@ -301,8 +404,9 @@ class GmrArmRetargeter:
                     task.set_target(mink.SE3.from_matrix(targets[key_body.robot_body]))
                     active.append(task)
             if active:
-                self._solve_stage(active, constraints)
+                self._solve_stage(active, constraints, preferences)
         q = self.configuration.q
+        self.last_diagnostics["solve_time_s"] = time.perf_counter() - started
         return {side: q[self.qpos_ids[side]].copy() for side in sides}
 
     def _solve_decoupled(self, targets, sides):
@@ -412,6 +516,7 @@ class TrackerArmMapper:
         self.filters = {side: PoseTargetFilter() for side in SIDES}
         self.status = {side: "waiting" for side in SIDES}
         self.tracker_positions = {side: None for side in SIDES}
+        self.tracker_rotations = {side: None for side in SIDES}
         self.raw_targets = {side: None for side in SIDES}
         self.targets = {side: None for side in SIDES}
         self.errors = {side: None for side in SIDES}
@@ -475,6 +580,7 @@ class TrackerArmMapper:
         for side, serial in self.serials.items():
             pose = frame.poses.get(serial)
             self.tracker_positions[side] = None if pose is None else pose[:3, 3].copy()
+            self.tracker_rotations[side] = None if pose is None else pose[:3, :3].copy()
             if pose is None:
                 self.status[side] = "lost"
                 self.goals.pop(side, None)

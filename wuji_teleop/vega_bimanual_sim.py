@@ -70,7 +70,8 @@ TRACKER_CSV_HEADER = (
          for i in range(3) for j in range(3)]
         + [f"ik_j{i}" for i in range(1, 8)]
         + [f"actual_j{i}" for i in range(1, 8)]
-        + [f"elbow_{axis}" for axis in "xyz"])
+        + [f"elbow_{axis}" for axis in "xyz"]
+        + [f"tracker_r{i}{j}" for i in range(3) for j in range(3)])
 )
 
 
@@ -542,7 +543,8 @@ def run(sources, *, mode="pico", pose_sources=None, imu_sources=None,
                                               *ik_goal, *data.qpos[arm.qpos_ids],
                                               *data.xpos[mujoco.mj_name2id(
                                                   model, mujoco.mjtObj.mjOBJ_BODY,
-                                                  body_names(side)["elbow"])])
+                                                  body_names(side)["elbow"])],
+                                              *tracker_mapper.tracker_rotations[side].ravel())
                                     csv_file.write(
                                         ",".join(str(v) if isinstance(v, str)
                                                  else f"{v:.6f}" for v in values) + "\n")

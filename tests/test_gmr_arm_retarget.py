@@ -81,6 +81,162 @@ class GmrArmRetargeterTests(unittest.TestCase):
         raw = json.loads(Path(DEFAULT_IK_CONFIG).read_text())
         self.assertEqual(raw["ik_match_table1"]["L_ee"][0], "Left_Wrist")
 
+    def test_tracker_mount_correction_removes_roll_arc_before_filtering(self):
+        config = load_ik_config()
+        config["tracker_mount_height_m"] = {"left": 0.04, "right": 0.05}
+        solver = self.make(config)
+        centers = self.ee_poses(solver)
+        rest = {}
+        offsets = {}
+        for index, side in enumerate(SIDES):
+            pose = centers[side].copy()
+            # Arbitrary mounting axes must not change the corrected centre.
+            pose[:3, :3] = Rotation.from_euler("xyz", [0.3, -0.5, index + 0.8]).as_matrix()
+            height = config["tracker_mount_height_m"][side]
+            pose[:3, 3] += [0, 0, height]
+            offsets[side] = pose[:3, :3].T @ np.array([0, 0, -height])
+            rest[side] = pose
+        mapper = TrackerArmMapper(solver, left_serial="left", right_serial="right")
+        snapshot = lambda poses, i: TrackerSnapshot(
+            TrackerFrame(poses, None, i, i / 60.0), i, i, None)
+        mapper.calibrate(snapshot(rest, 0), self.home, 0.0)
+        initial_targets = solver.targets({WRIST_BODIES[s]: p for s, p in rest.items()})
+        for i, angle in enumerate(np.linspace(-0.7, 0.7, 40), start=1):
+            moved = {}
+            for side in SIDES:
+                pose = rest[side].copy()
+                pose[:3, :3] = Rotation.from_euler("x", angle).as_matrix() @ pose[:3, :3]
+                pose[:3, 3] = centers[side][:3, 3] - pose[:3, :3] @ offsets[side]
+                moved[side] = pose
+            mapper.update(snapshot(moved, i), i / 60.0)
+            for side in SIDES:
+                body = body_names(side)["ee"]
+                np.testing.assert_allclose(mapper.raw_targets[side][:3, 3],
+                                           initial_targets[body][:3, 3], atol=1e-12)
+                np.testing.assert_allclose(mapper.targets[side][:3, 3],
+                                           initial_targets[body][:3, 3], atol=1e-12)
+        # Real translation still passes through the mapping after pivot correction.
+        before = solver.targets({WRIST_BODIES[s]: p for s, p in moved.items()})
+        for pose in moved.values():
+            pose[:3, 3] += [0.03, 0, 0]
+        after = solver.targets({WRIST_BODIES[s]: p for s, p in moved.items()})
+        for body in before:
+            np.testing.assert_allclose(after[body][:3, 3] - before[body][:3, 3],
+                                       solver.heading.T @ [0.03, 0, 0], atol=1e-12)
+            np.testing.assert_allclose(after[body][:3, :3], before[body][:3, :3])
+        mapper.update(snapshot({"right": moved["right"]}, 41), 41 / 60.0)
+        self.assertEqual(mapper.status["left"], "lost")
+        self.assertEqual(mapper.update(snapshot(moved, 42), 2.0), {})
+        self.assertEqual(mapper.status["right"], "holding")
+
+    def test_mount_heights_validate_and_zero_preserves_mapping(self):
+        for value in (-0.01, 0.21, float("nan"), float("inf")):
+            config = load_ik_config()
+            config["tracker_mount_height_m"] = {"left": value}
+            with self.assertRaisesRegex(ValueError, "tracker_mount_height_m"):
+                self.make(config)
+        config = load_ik_config()
+        config["tracker_mount_height_m"] = {"left": 0, "right": 0}
+        a, b = self.make(), self.make(config)
+        human = self.rest_pose_human(a)
+        for solver in (a, b):
+            solver.calibrate(human, self.home)
+        for pose in human.values():
+            pose[:3, :3] = Rotation.from_euler("y", 0.4).as_matrix() @ pose[:3, :3]
+        for body, pose in a.targets(human).items():
+            np.testing.assert_array_equal(pose, b.targets(human)[body])
+
+    def test_elbow_preference_reduces_wrist_turn_motion_through_mapper(self):
+        from scripts.evaluate_gmr_elbow import evaluate
+
+        root = DEFAULT_IK_CONFIG.parent
+        baseline = evaluate(self.model, self.arms,
+                            root / "xr_trackers_to_vega_1u_stage_split_soft.json")
+        config = load_ik_config(root / "xr_trackers_to_vega_1u_elbow.json")
+        # This elbow-only fixture places tracker origins at wrist centres.
+        # Mount compensation is tested separately with genuine rotating arcs.
+        config["tracker_mount_height_m"] = {}
+        candidate = evaluate(self.model, self.arms, config)
+        repeated = evaluate(self.model, self.arms, config)
+        for phase in ("wrist_x", "wrist_y", "wrist_z"):
+            before, after = baseline["summary"][phase], candidate["summary"][phase]
+            self.assertLess(after["elbow_max_m"], before["elbow_max_m"] * 0.5)
+            self.assertLess(after["position_p95_m"], 0.005)
+            # A soft elbow prior trades orientation accuracy for stability.
+            self.assertLess(after["orientation_p95_deg"], 15)
+        self.assertLess(candidate["summary"]["reach"]["position_p95_m"], 0.002)
+        for row, again in zip(candidate["rows"], repeated["rows"]):
+            for side in SIDES:
+                np.testing.assert_array_equal(row["q"][side], again["q"][side])
+                q = np.asarray(row["q"][side])
+                self.assertTrue(np.all(q >= self.arms[side].lower - 1e-8))
+                self.assertTrue(np.all(q <= self.arms[side].upper + 1e-8))
+        loss = [r for r in candidate["rows"] if r["status"]["left"] == "lost"]
+        self.assertTrue(loss)
+        for row in loss[1:]:
+            np.testing.assert_array_equal(row["q"]["left"], loss[0]["q"]["left"])
+
+    def test_elbow_preference_fades_at_unreachable_target_and_recalibrates(self):
+        config = DEFAULT_IK_CONFIG.with_name("xr_trackers_to_vega_1u_elbow.json")
+        solver = self.make(config)
+        solver.calibrate(self.rest_pose_human(solver), self.home)
+        target = solver.targets(self.rest_pose_human(solver))
+        target["L_ee"][:3, 3] += [3, 0, 0]
+        solver._elbow_preferences(target)
+        np.testing.assert_allclose(solver.elbow_tasks["left"].cost[:3], 0)
+        old = solver.elbow_rest["left"][0].copy()
+        changed = {s: q.copy() for s, q in self.home.items()}
+        changed["left"][0] += 0.1
+        solver.calibrate(self.rest_pose_human(solver), changed)
+        self.assertGreater(np.linalg.norm(solver.elbow_rest["left"][0] - old), 0.001)
+
+    def test_inward_offset_blends_bilaterally_only_on_retraction(self):
+        config = load_ik_config(DEFAULT_IK_CONFIG.with_name("xr_trackers_to_vega_1u_elbow.json"))
+        old_config = copy.deepcopy(config)
+        for spec in old_config["elbow_preference"].values():
+            spec.pop("inward_offset_m")
+        baseline, shifted = self.make(old_config), self.make(config)
+        for solver in (baseline, shifted):
+            solver.calibrate(self.rest_pose_human(solver), self.home)
+        rest = shifted.targets(self.rest_pose_human(shifted))
+        for retraction, expected in ((-0.05, 0), (0, 0), (0.05, 0.0075),
+                                     (0.10, 0.015), (0.20, 0.015)):
+            targets = {b: p.copy() for b, p in rest.items()}
+            for pose in targets.values():
+                pose[0, 3] -= retraction
+                pose[:3, :3] = pose[:3, :3] @ Rotation.from_euler("x", 0.4).as_matrix()
+            for solver in (baseline, shifted):
+                solver._elbow_preferences(targets)
+            for side in SIDES:
+                a = baseline.elbow_tasks[side].transform_target_to_world.translation()
+                b = shifted.elbow_tasks[side].transform_target_to_world.translation()
+                np.testing.assert_allclose(b - a, [0, -np.sign(a[1]) * expected, 0], atol=1e-12)
+            if retraction <= 0:
+                a, b = baseline.solve(targets), shifted.solve(targets)
+                for side in SIDES:
+                    np.testing.assert_array_equal(a[side], b[side])
+        # Actual inward reaches remain finite and bounded under the soft prior.
+        for amount in np.linspace(0, 0.10, 60):
+            targets = {b: p.copy() for b, p in rest.items()}
+            for pose in targets.values():
+                pose[0, 3] -= amount
+            goals = shifted.solve(targets)
+            for side in SIDES:
+                self.assertTrue(np.isfinite(goals[side]).all())
+                self.assertTrue(np.all(goals[side] >= self.arms[side].lower - 1e-8))
+                self.assertTrue(np.all(goals[side] <= self.arms[side].upper + 1e-8))
+
+    def test_invalid_inward_parameters_are_rejected(self):
+        config = load_ik_config(DEFAULT_IK_CONFIG.with_name("xr_trackers_to_vega_1u_elbow.json"))
+        for key, value in (("inward_offset_m", -0.01), ("inward_offset_m", float("nan")),
+                           ("inward_blend_distance_m", 0),
+                           ("inward_blend_distance_m", float("inf"))):
+            with self.subTest(key=key, value=value):
+                bad = copy.deepcopy(config)
+                bad["elbow_preference"]["left"][key] = value
+                with self.assertRaisesRegex(ValueError, key):
+                    self.make(bad)
+
     def test_decoupled_wrist_rotation_does_not_move_upper_arm(self):
         config = Path(DEFAULT_IK_CONFIG).with_name("xr_trackers_to_vega_1u_decoupled.json")
         baseline, rotating = self.make(config), self.make(config)

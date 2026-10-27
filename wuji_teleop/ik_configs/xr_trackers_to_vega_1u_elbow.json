@@ -1,0 +1,25 @@
+{
+  "human_root_name": null,
+  "human_height_assumption": 1.75,
+  "tracker_mount_height_m": {"left": 0.03, "right": 0.03},
+  "use_ik_match_table1": true,
+  "use_ik_match_table2": true,
+  "human_scale_table": {"Left_Wrist": 1.0, "Right_Wrist": 1.0},
+  "ik_match_table1": {
+    "L_ee": ["Left_Wrist", 50, 0, [0, 0, 0], [1, 0, 0, 0]],
+    "R_ee": ["Right_Wrist", 50, 0, [0, 0, 0], [1, 0, 0, 0]]
+  },
+  "ik_match_table2": {
+    "L_ee": ["Left_Wrist", 50, 2, [0, 0, 0], [1, 0, 0, 0]],
+    "R_ee": ["Right_Wrist", 50, 2, [0, 0, 0], [1, 0, 0, 0]]
+  },
+  "posture_cost": 0.01,
+  "solver": "daqp",
+  "damping": 0.5,
+  "elbow_preference": {
+    "left": {"body": "L_arm_l4", "shoulder": "L_arm_l2", "cost": 9,
+             "inward_offset_m": 0.015, "inward_blend_distance_m": 0.10},
+    "right": {"body": "R_arm_l4", "shoulder": "R_arm_l2", "cost": 9,
+              "inward_offset_m": 0.015, "inward_blend_distance_m": 0.10}
+  }
+}
