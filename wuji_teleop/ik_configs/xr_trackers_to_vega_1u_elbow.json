@@ -2,6 +2,7 @@
   "human_root_name": null,
   "human_height_assumption": 1.75,
   "tracker_mount_height_m": {"left": 0.03, "right": 0.03},
+  "tracker_jump_threshold_m": 0.10,
   "use_ik_match_table1": true,
   "use_ik_match_table2": true,
   "human_scale_table": {"Left_Wrist": 1.0, "Right_Wrist": 1.0},

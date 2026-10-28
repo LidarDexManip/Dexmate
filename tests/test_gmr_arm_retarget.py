@@ -81,6 +81,33 @@ class GmrArmRetargeterTests(unittest.TestCase):
         raw = json.loads(Path(DEFAULT_IK_CONFIG).read_text())
         self.assertEqual(raw["ik_match_table1"]["L_ee"][0], "Left_Wrist")
 
+    def test_roll_alignment_maps_measured_axis_without_changing_position(self):
+        config = load_ik_config()
+        config["tracker_roll_axis_local"] = {s: [1, 0.3, 0.2] for s in SIDES}
+        corrected = self.make(config)
+        baseline = self.make()
+        human = self.rest_pose_human(baseline)
+        for solver in (baseline, corrected):
+            solver.calibrate(human, self.home)
+        for side in SIDES:
+            body = body_names(side)["ee"]
+            local = np.array([1, 0.3, 0.2]); local /= np.linalg.norm(local)
+            moved = {b: p.copy() for b, p in human.items()}
+            moved[WRIST_BODIES[side]][:3, :3] = human[WRIST_BODIES[side]][:3, :3] @ Rotation.from_rotvec(local * 0.5).as_matrix()
+            before, after = baseline.targets(moved), corrected.targets(moved)
+            np.testing.assert_array_equal(before[body][:3, 3], after[body][:3, 3])
+            delta = Rotation.from_matrix(after[body][:3, :3] @ human[WRIST_BODIES[side]][:3, :3].T).as_rotvec()
+            roll_axis = corrected.configuration.data.xaxis[corrected.roll_joint_ids[side]]
+            self.assertAlmostEqual(abs(np.dot(delta / np.linalg.norm(delta), roll_axis)), 1.0)
+            self.assertAlmostEqual(np.linalg.norm(delta), 0.5)
+            # Intentional bend remains a rotation of the same magnitude.
+            bend_axis = np.cross(local, [0, 0, 1]); bend_axis /= np.linalg.norm(bend_axis)
+            moved[WRIST_BODIES[side]][:3, :3] = human[WRIST_BODIES[side]][:3, :3] @ Rotation.from_rotvec(bend_axis * 0.3).as_matrix()
+            bent = corrected.targets(moved)[body][:3, :3]
+            delta = Rotation.from_matrix(bent @ human[WRIST_BODIES[side]][:3, :3].T).as_rotvec()
+            self.assertAlmostEqual(np.linalg.norm(delta), 0.3)
+            self.assertAlmostEqual(np.dot(delta, roll_axis), 0.0, places=9)
+
     def test_tracker_mount_correction_removes_roll_arc_before_filtering(self):
         config = load_ik_config()
         config["tracker_mount_height_m"] = {"left": 0.04, "right": 0.05}
@@ -507,6 +534,30 @@ class TrackerArmMapperTests(unittest.TestCase):
         self.assertEqual(self.mapper.status["left"], "holding")
         with self.assertRaisesRegex(ValueError, "stale"):
             self.mapper.calibrate(old, self.home, time.monotonic())
+
+    def test_position_jump_holds_one_side_until_return_or_recalibration(self):
+        self.mapper.retargeter.jump_threshold = 0.10
+        poses = {"SN-L": self.ee["left"].copy(), "SN-R": self.ee["right"].copy()}
+        self.mapper.calibrate(self.snapshot(poses, received_at=0), self.home, 0)
+        self.mapper.update(self.snapshot(poses, received_at=0.02), 0.02)
+        held = self.mapper.retargeter.configuration.q.copy()
+        filtered = self.mapper.filters["left"].pose.copy()
+        jumped = {s: p.copy() for s, p in poses.items()}
+        jumped["SN-L"][:3, 3] += [1.0, 0, 0]
+        for t in (0.04, 0.06, 0.08):
+            sample = self.snapshot(jumped, received_at=t)
+            goals = self.mapper.update(sample, t)
+            self.assertNotIn("left", goals)
+            self.assertIn("right", goals)
+            self.assertNotIn("left", self.mapper.update(sample, t))
+            np.testing.assert_array_equal(self.mapper.filters["left"].pose, filtered)
+            ids = self.mapper.retargeter.qpos_ids["left"]
+            np.testing.assert_allclose(self.mapper.retargeter.configuration.q[ids], held[ids], atol=1e-12)
+        self.assertEqual(self.mapper.jump_rejections["left"], 3)
+        self.assertIn("left", self.mapper.update(self.snapshot(poses, received_at=0.10), 0.10))
+        self.mapper.calibrate(self.snapshot(jumped, received_at=0.12), self.home, 0.12)
+        self.assertIn("left", self.mapper.update(self.snapshot(jumped, received_at=0.14), 0.14))
+        self.assertEqual(self.mapper.jump_rejections["left"], 0)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,56 @@ the tracker is not directly above the wrist centre, a full measured local
 translation is needed instead. Existing general-motion logs cannot reliably
 identify a wrist pivot without a deliberate stationary-centre calibration.
 
+## Position-jump hold and measured roll alignment (2026-10-28)
+
+The elbow config now enables `tracker_jump_threshold_m: 0.10`. A tracker
+translation more than 10 cm from that side's last accepted translation is
+rejected before target filtering or IK. That arm holds; the other may continue.
+Repeated rejected samples cannot move the accepted reference. Returning near
+the last accepted position resumes tracking; R explicitly accepts a new origin.
+This also applies on reacquisition. A persistent tracking-origin change requires
+R, and slow accumulated drift below the threshold is not detected. Configs
+omitting the field retain the prior behavior.
+
+The optional `xr_trackers_to_vega_1u_roll_aligned.json` adds per-tracker local
+roll axes measured from the 439–459 s interval of the October 28 recording.
+The leading singular vector of the successive local rotation vectors captured
+97.8% (left) and 97.5% (right) of rotational variation. Axes use the converted
+tracker-local coordinates from `xr_pose_to_robot`, not raw OpenXR coordinates.
+They describe this particular mounting and must be re-estimated if the tracker
+mounting changes materially.
+
+At calibration, the measured roll axis is expressed in robot space and aligned
+by the shortest rotation to the robot's joint-5 axis. Subsequent orientation
+deltas are conjugated by that alignment about the calibrated robot orientation.
+This preserves rotation angles and all three orientation degrees of freedom;
+it remaps bend axes rather than suppressing intentional bend. Position targets,
+mount correction, elbow costs and inward allowance are unchanged. The alignment
+is fixed for that calibration, not a dynamically measured human forearm axis.
+
+Comparison command (raw recording is local, not committed):
+
+```bash
+.venv/bin/python scripts/compare_recorded_wrist_roll.py \
+  /tmp/gmr-wrist-demo-20261028.csv \
+  wuji_teleop/ik_configs/xr_trackers_to_vega_1u_elbow.json \
+  wuji_teleop/ik_configs/xr_trackers_to_vega_1u_roll_aligned.json \
+  --start 439 --end 459 --output /tmp/gmr-recorded-roll-comparison.json
+```
+
+This recalibrates both variants at the first selected frame. It is a controlled
+comparison, not an exact reproduction of the session's unknown calibration.
+Recorded-input joint-6/7 RMS deviation from neutral dropped from 13.86 to 6.78
+degrees on the left and 7.64 to 7.27 on the right. Both variants rejected 18 right
+position samples. With translation synthetically removed while retaining the
+measured rotations, the values were 11.54 to 6.37 and 7.27 to 6.71 degrees. This
+is in-sample evidence, not independent validation or a claim of zero bend.
+
+For the live experiment use the roll-aligned config with the existing tracker
+launcher and `FINGER_INPUT=synthetic`. Hold forearms level, palms down, then R.
+The launcher default and hardware launchers are unchanged. Set
+`tracker_roll_axis_local` to an empty object to disable the alignment.
+
 This is a competing weighted cost, not a strict null-space task. It does not
 guarantee a fixed elbow, human elbow tracking, or collision avoidance. It uses
 an inferred posture because there is no elbow tracker. The reach estimate is

@@ -117,6 +117,8 @@ def load_ik_config(path=DEFAULT_IK_CONFIG):
         "damping": float(config.get("damping", 0.5)),
         "elbow_preference": config.get("elbow_preference", {}),
         "tracker_mount_height_m": config.get("tracker_mount_height_m", {}),
+        "tracker_jump_threshold_m": config.get("tracker_jump_threshold_m"),
+        "tracker_roll_axis_local": config.get("tracker_roll_axis_local", {}),
     }
 
 
@@ -147,6 +149,18 @@ class GmrArmRetargeter:
                     for side, height in self.tracker_mount_heights.items())):
             raise ValueError("tracker_mount_height_m must map left/right to heights in [0, 0.20] metres")
         self.tracker_center_offsets = {}
+        self.jump_threshold = config.get("tracker_jump_threshold_m")
+        if self.jump_threshold is not None:
+            self.jump_threshold = float(self.jump_threshold)
+            if not math.isfinite(self.jump_threshold) or self.jump_threshold <= 0:
+                raise ValueError("tracker_jump_threshold_m must be positive and finite")
+        self.roll_axes = config.get("tracker_roll_axis_local", {})
+        for side, axis in self.roll_axes.items():
+            vector = np.asarray(axis, dtype=float)
+            if (side not in SIDES or vector.shape != (3,) or
+                    not np.isfinite(vector).all() or np.linalg.norm(vector) < 1e-6):
+                raise ValueError("tracker_roll_axis_local requires finite nonzero left/right vectors")
+        self.roll_alignment = {}
         self.tables = config["tables"]
         # Targets come from the first enabled table's offsets for both stages, as in GMR.
         self.key_bodies = {key_body.robot_body: key_body for key_body in self.tables[0]}
@@ -166,13 +180,14 @@ class GmrArmRetargeter:
                                       orientation_cost=key_body.orientation_cost,
                                       lm_damping=1.0)
                        for key_body in table] for table in self.tables]
-        self.qpos_ids, self.dof_ids = {}, {}
+        self.qpos_ids, self.dof_ids, self.roll_joint_ids = {}, {}, {}
         for side, names in arm_joint_names.items():
             ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in names]
             if min(ids) < 0:
                 raise ValueError(f"{side.capitalize()} arm joints are missing from the model")
             self.qpos_ids[side] = model.jnt_qposadr[ids]
             self.dof_ids[side] = model.jnt_dofadr[ids]
+            self.roll_joint_ids[side] = ids[4]
         posture_cost = np.zeros(model.nv)
         for dofs in self.dof_ids.values():
             posture_cost[dofs] = config["posture_cost"]
@@ -291,6 +306,23 @@ class GmrArmRetargeter:
                       robot[:3, :3] @ key_body.position_offset)
             offsets[robot_body] = (rotation_offset, robot[:3, 3] - scaled)
         self.offsets = offsets
+        self.roll_alignment = {}
+        for body, key in self.key_bodies.items():
+            side = self.side_of[body]
+            if side not in self.roll_axes:
+                continue
+            source = frames[key.human_body][:3, :3] @ np.asarray(self.roll_axes[side])
+            source /= np.linalg.norm(source)
+            destination = self.configuration.data.xaxis[self.roll_joint_ids[side]].copy()
+            # A fitted axis has an arbitrary sign. Choose the nearby direction.
+            if np.dot(source, destination) < 0:
+                source = -source
+            cross = np.cross(source, destination)
+            sine = np.linalg.norm(cross)
+            alignment = (np.eye(3) if sine < 1e-10 else Rotation.from_rotvec(
+                cross / sine * math.atan2(sine, np.dot(source, destination))).as_matrix())
+            neutral = self.configuration.get_transform_frame_to_world(body, "body").rotation().as_matrix()
+            self.roll_alignment[body] = (alignment, neutral)
         self.elbow_rest = {}
         for side, spec in self.elbow_specs.items():
             elbow = self.configuration.get_transform_frame_to_world(
@@ -351,6 +383,10 @@ class GmrArmRetargeter:
             target[:3, :3] = frame[:3, :3] @ key_body.rotation_offset @ rotation_offset
             target[:3, 3] = (self.scales[key_body.human_body] * frame[:3, 3] +
                              target[:3, :3] @ key_body.position_offset + position_offset)
+            if robot_body in self.roll_alignment:
+                alignment, neutral = self.roll_alignment[robot_body]
+                delta = target[:3, :3] @ neutral.T
+                target[:3, :3] = alignment @ delta @ alignment.T @ neutral
             targets[robot_body] = target
         return targets
 
@@ -524,6 +560,8 @@ class TrackerArmMapper:
         self.last_revision = None
         self.last_frame_time = None
         self.body_of = {side: body for body, side in retargeter.side_of.items()}
+        self.accepted_tracker_positions = {}
+        self.jump_rejections = {side: 0 for side in SIDES}
 
     def _fresh_frame(self, snapshot, now):
         if snapshot.error:
@@ -552,6 +590,9 @@ class TrackerArmMapper:
         human = {WRIST_BODIES[side]: frame.poses[serial] for side, serial in serials.items()}
         self.retargeter.calibrate(human, arm_targets, root=frame.headset, yaw=yaw)
         self.serials = serials
+        self.accepted_tracker_positions = {
+            side: frame.poses[serial][:3, 3].copy() for side, serial in serials.items()}
+        self.jump_rejections = {side: 0 for side in SIDES}
         for side in SIDES:
             self.filters[side].reset()
             self.status[side] = "calibrated"
@@ -585,6 +626,14 @@ class TrackerArmMapper:
                 self.status[side] = "lost"
                 self.goals.pop(side, None)
             else:
+                previous = self.accepted_tracker_positions[side]
+                threshold = self.retargeter.jump_threshold
+                if threshold is not None and np.linalg.norm(pose[:3, 3] - previous) > threshold:
+                    self.status[side] = "jump hold (return to previous pose or press R)"
+                    self.jump_rejections[side] += 1
+                    self.goals.pop(side, None)
+                    continue
+                self.accepted_tracker_positions[side] = pose[:3, 3].copy()
                 human[WRIST_BODIES[side]] = pose
         if not human:
             return {}
