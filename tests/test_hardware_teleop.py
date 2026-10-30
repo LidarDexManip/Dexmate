@@ -1,10 +1,11 @@
 """Reset / start / pause control of both Vega arms and Wuji hands, without hardware."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import mujoco
 import numpy as np
@@ -15,6 +16,7 @@ from wuji_teleop.hardware_teleop import (
     DEVICE_LINKS,
     FakeArms,
     FakeHands,
+    HAND_MIT_GAINS,
     HandLinkBlocked,
     HardwareTeleop,
     HeldWristImu,
@@ -25,7 +27,9 @@ from wuji_teleop.hardware_teleop import (
     TeleopLimits,
     TrackerArmMapping,
     TrackerLinks,
+    WujiHands,
     _ImuSlot,
+    main,
     reset_pose,
 )
 from wuji_teleop.sources import HandFrame, SourceSnapshot, SyntheticSource
@@ -74,6 +78,22 @@ class _Glove:
         self.count += 1
         frame = HandFrame(np.zeros((21, 3)), self.clock(), self.count, self.count)
         return SourceSnapshot(frame, self.count, self.count, None)
+
+
+class _DroppedGlove:
+    """A glove whose last frame arrived at `last_frame_at` (the SDK dropped it)."""
+
+    serial = "WG1-dropped"
+
+    def __init__(self, last_frame_at):
+        self.frame = HandFrame(np.zeros((21, 3)), last_frame_at, 1, 1)
+        self.closed = False
+
+    def read(self):
+        return SourceSnapshot(self.frame, 1, 1, None)
+
+    def close(self):
+        self.closed = True
 
 
 class _FixedRetargeter:
@@ -505,6 +525,27 @@ class TeleopAppTests(unittest.TestCase):
         self.assertTrue(any("Starting without: Right glove" in m
                             for m in app.status()["messages"]))
 
+    def test_silent_glove_is_closed_and_reconnected(self):
+        gloves = []
+
+        def connect_glove(side):
+            glove = _DroppedGlove(time.monotonic() - 10.0)
+            gloves.append(glove)
+            return glove, HeldWristImu()
+
+        app = self._app()
+        app.connect_glove = connect_glove
+        self._step(app, 0.0, "gloves_step")
+        self.assertEqual(app.links["Left glove"].level, "fail")
+        self.assertIn("reconnecting", app.links["Left glove"].hint)
+        self.assertTrue(all(glove.closed for glove in gloves))
+        self.assertEqual(app.gloves, {})
+        self.assertEqual(app.glove_slots["left"].read().error, "glove not connected")
+        self._step(app, 1.0, "gloves_step")  # before the retry delay
+        self.assertEqual(len(gloves), 2)
+        self._step(app, 6.0, "gloves_step")
+        self.assertEqual(len(gloves), 4)
+
     def test_blocked_hand_is_not_attempted_and_shows_the_fix(self):
         app = self._app(hands=_BlockedHands())
         self._step(app, 0.0, "robot_step", "hands_step")
@@ -543,6 +584,76 @@ class TeleopAppTests(unittest.TestCase):
         status = app.status()
         self.assertEqual(status["state"], "connecting")
         self.assertEqual(set(status["links"]), set(DEVICE_LINKS + SyntheticPicoLinks.link_names))
+
+
+class _FakeWujiHand:
+    def __init__(self, handedness, serial_number="WH2JA0001"):
+        self.gains, self.info = [], SimpleNamespace(firmware_version="2.13.1")
+        self._handedness = handedness
+        self.serial_number = serial_number
+
+    def handedness(self):
+        return SimpleNamespace(get=lambda: self._handedness)
+
+    def mit_params(self):
+        return SimpleNamespace(set=self.gains.append)
+
+    def joint_states(self):
+        return SimpleNamespace(subscribe_with_callback=lambda callback: object())
+
+
+class WujiHandsTests(unittest.TestCase):
+    def connect_left(self, *, serial_number="WH2JA0001", **kwargs):
+        hand = _FakeWujiHand("Handedness.Left", serial_number)
+        self.connections = []
+
+        def connect(**options):
+            self.connections.append(options)
+            return hand
+
+        manager = SimpleNamespace(connect=connect, disconnect=lambda alias: None)
+        with patch("wuji_sdk.SdkManager.instance", return_value=manager), \
+                patch("wuji_teleop.connection_monitor.ambiguous_hand_source", return_value=None):
+            hands = WujiHands({"left": "WH2JA0001"}, **kwargs)
+            hands.addresses["left"] = "192.168.77.110:50001"
+            hands.connect("left")
+        self.assertTrue(hands.is_connected("left"))
+        return hand
+
+    def test_discovery_scans_in_a_child_process(self):
+        scanned = [
+            {"sn": "WH2JA0001", "type": "DeviceType.WujiHand2", "address": "192.168.77.110:50001"},
+            {"sn": "WG1KA0002", "type": "DeviceType.WujiGlove", "address": "192.168.1.101:50001"},
+        ]
+        with patch("wuji_sdk.SdkManager.instance"), \
+                patch("wuji_teleop.connection_monitor.wuji_scan_isolated", return_value=scanned):
+            hands = WujiHands()
+            hands.discover()
+        self.assertEqual(hands.serials, {"left": "WH2JA0001", "right": None})
+        self.assertEqual(hands.addresses, {"left": "192.168.77.110:50001", "right": None})
+
+    def test_connect_goes_by_discovered_address_with_a_timeout(self):
+        self.connect_left()
+        (options,) = self.connections
+        self.assertEqual(options["address"], "192.168.77.110:50001")
+        self.assertNotIn("sn", options)
+        self.assertEqual(options["options"].timeout_ms, 3000)
+
+    def test_connect_refuses_a_different_hand_at_the_address(self):
+        with self.assertRaisesRegex(RuntimeError, "expected WH2JA0001"):
+            self.connect_left(serial_number="WH2JA0009")
+
+    def test_connect_writes_the_default_finger_gains(self):
+        self.assertEqual(HAND_MIT_GAINS, (1.5, 0.1))
+        self.assertEqual(self.connect_left().gains, [(1.5, 0.1)])
+
+    def test_connect_writes_requested_finger_gains(self):
+        self.assertEqual(self.connect_left(mit_gains=(5, 0.2)).gains, [(5.0, 0.2)])
+
+    def test_out_of_range_finger_gains_are_rejected(self):
+        for flags in (["--hand-kp", "0"], ["--hand-kp", "20"], ["--hand-kd", "-0.1"]):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(["--fake-robot", "--synthetic-input", *flags])
 
 
 if __name__ == "__main__":

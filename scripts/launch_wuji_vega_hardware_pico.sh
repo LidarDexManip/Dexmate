@@ -13,7 +13,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "Env overrides: ARM_INPUT (tracker | pico-hand), ROBOT_NAME, ZENOH_CONFIG,"
   echo "  LEFT_GLOVE_SN, RIGHT_GLOVE_SN, LEFT_HAND_SN, RIGHT_HAND_SN,"
   echo "  LEFT_TRACKER_SN, RIGHT_TRACKER_SN, IK_CONFIG, HUMAN_HEIGHT,"
-  echo "  PICO_SCALE, RESET_SHOULDER_BACK, WIFI_INTERFACE, DEXSTREAM_BIN."
+  echo "  PICO_SCALE, RESET_SHOULDER_BACK, HAND_KP, HAND_KD, WIFI_INTERFACE, DEXSTREAM_BIN."
   echo "Rehearse with the real inputs but no robot: $0 --fake-robot"
   exit 0
 fi
@@ -98,6 +98,8 @@ python_cmd=("$workspace/.venv/bin/python" -m wuji_teleop.hardware_teleop --arm-i
 [[ -n "${HUMAN_HEIGHT:-}" ]] && python_cmd+=(--human-height "$HUMAN_HEIGHT")
 [[ -n "${PICO_SCALE:-}" ]] && python_cmd+=(--pico-scale "$PICO_SCALE")
 [[ -n "${RESET_SHOULDER_BACK:-}" ]] && python_cmd+=(--reset-shoulder-back "$RESET_SHOULDER_BACK")
+[[ -n "${HAND_KP:-}" ]] && python_cmd+=(--hand-kp "$HAND_KP")
+[[ -n "${HAND_KD:-}" ]] && python_cmd+=(--hand-kd "$HAND_KD")
 python_cmd+=("$@")
 log_cmd python "${python_cmd[@]}"
 "${python_cmd[@]}"

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import socket
@@ -215,6 +216,27 @@ def wuji_scan():
         devices.append({"sn": str(d.sn), "type": str(d.device_type), "address": address,
                         "ip": address.rsplit(":", 1)[0]})
     return devices
+
+
+def wuji_scan_isolated(timeout=20.0):
+    """`wuji_scan` in a child process, for callers that must keep running.
+
+    wuji_sdk holds the GIL for the whole scan (~3 s), freezing every other
+    thread in the calling process: a teleop's arm loop and its glove streams,
+    which then miss heartbeats and are dropped by the SDK.
+    """
+    code = ("import json\nfrom wuji_teleop.connection_monitor import wuji_scan\n"
+            "print(json.dumps(wuji_scan()))")
+    try:
+        result = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True,
+                                text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Wuji discovery took over {timeout:.0f} s") from None
+    lines = result.stdout.strip().splitlines()
+    if result.returncode != 0 or not lines:
+        detail = (result.stderr.strip().splitlines() or ["no output"])[-1]
+        raise RuntimeError(f"Wuji discovery failed: {detail}")
+    return json.loads(lines[-1])
 
 
 def connect_checks(scanned):

@@ -87,3 +87,11 @@ To restart the sim without dropping the Pico page:
 | Status stays `hand waiting` | Headset is not tracking the hand: enter AR, controllers down, hand in view. |
 | Arm offset or too high | Hold your hand in your working position and press **R**. |
 | `DexStream not found` | Rerun `scripts/setup_sim.sh`, or set `DEXSTREAM_BIN`. |
+
+## Browser end-effector dashboard (no Pico)
+
+Install `requirements-wuji-web.txt`, run `scripts/launch_vega_ee_preview.sh`, and
+open http://127.0.0.1:8088 on the laptop. Simulation is the default. The full-body
+preview, device status, keyboard jogging and mouse-drag target pads run in the
+browser. See [EE_PREVIEW_RUNBOOK.md](EE_PREVIEW_RUNBOOK.md) before connecting gloves
+or using the explicit hardware mode.

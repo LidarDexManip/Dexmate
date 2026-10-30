@@ -59,6 +59,10 @@ TRACKER_IK_CONFIG = (Path(__file__).with_name("ik_configs")
                      / "xr_trackers_to_vega_1u_decoupled.json")
 ARM_RATE_HZ = 100.0
 TELEOP_RATE_HZ = 40.0
+# Wuji MIT impedance (kp, kd) written to every hand on connect, so a firmware
+# upgrade or a swapped hand cannot silently change the stiffness. kp 12 / kd 0.3
+# (an old left-hand setting) made the finger motors buzz while holding.
+HAND_MIT_GAINS = (1.5, 0.1)
 STATE_COLORS = {
     "paused": "#c58a00", "planning": "#2a6fb0", "resetting": "#2a6fb0",
     "running": "#1d8a3a", "estop": "#b3261e", "fault": "#b3261e",
@@ -128,15 +132,17 @@ class WujiHands:
 
     ``connect`` refuses a hand whose network path is ambiguous (see
     ``connection_monitor.ambiguous_hand_source``): the failed attempt that
-    would follow locks the hand until a 12 V power cycle.
+    would follow locks the hand until a 12 V power cycle. It also writes
+    ``mit_gains`` to the hand before anything can enable it (not saved to flash).
     """
 
-    def __init__(self, serials=None):
+    def __init__(self, serials=None, mit_gains=HAND_MIT_GAINS):
         import wuji_sdk
 
         wuji_sdk.set_log_level("warn")
         self._sdk = wuji_sdk
         self._manager = wuji_sdk.SdkManager.instance()
+        self.mit_gains = tuple(float(g) for g in mit_gains)
         self.serials = {side: (serials or {}).get(side) for side in SIDES}
         self.addresses = {side: None for side in SIDES}
         self.firmware = {side: None for side in SIDES}
@@ -146,14 +152,20 @@ class WujiHands:
         self._hands, self._subscriptions, self._publishers = {}, {}, {}
 
     def discover(self):
-        """Fill in each side's serial and address from the SDK discovery scan."""
+        """Fill in each side's serial and address from the SDK discovery scan.
+
+        The scan runs in a child process: in-process it holds the GIL for ~3 s,
+        so retrying a missing hand froze the arm loop and the glove streams.
+        """
+        from .connection_monitor import wuji_scan_isolated
+
         found = {side: [] for side in SIDES}
-        for device in self._manager.scan():
-            sn = str(device.sn)
+        for device in wuji_scan_isolated():
+            sn = device["sn"]
             # Wuji serials carry handedness in the 4th character: J left, K right.
             side = {"J": "left", "K": "right"}.get(sn[3:4])
-            if device.device_type == self._sdk.DeviceType.WujiHand2 and side:
-                found[side].append((sn, str(device.address)))
+            if device["type"].endswith("WujiHand2") and side:
+                found[side].append((sn, device["address"]))
         for side in SIDES:
             matches = [hand for hand in found[side] if self.serials[side] in (None, hand[0])]
             self.addresses[side] = matches[0][1] if len(matches) == 1 else None
@@ -172,11 +184,19 @@ class WujiHands:
         if unsafe:
             raise HandLinkBlocked(unsafe)
         alias = f"vega_{side}_wuji_hand"
-        hand = self._manager.connect(sn=self.serials[side], device_name=alias)
+        # By address with a short timeout: by serial, this process's SDK (which
+        # never scanned) runs its own discovery and holds the GIL for ~18 s.
+        hand = self._manager.connect(
+            address=self.addresses[side], device_name=alias,
+            options=self._sdk.ConnectOptions(timeout_ms=3000, retry_count=1))
         try:
+            if str(hand.serial_number) != self.serials[side]:
+                raise RuntimeError(f"{self.addresses[side]} is {hand.serial_number}, "
+                                   f"expected {self.serials[side]}")
             reported = str(hand.handedness().get()).lower()
             if side not in reported:
                 raise RuntimeError(f"{self.serials[side]} reports {reported}, expected {side}")
+            hand.mit_params().set(self.mit_gains)
             subscription = hand.joint_states().subscribe_with_callback(
                 functools.partial(self._on_state, side))
         except BaseException:
@@ -926,6 +946,7 @@ class LinkStatus:
 
 
 DEVICE_LINKS = ("Robot arms", "Left hand", "Right hand", "Left glove", "Right glove")
+GLOVE_RECONNECT_S = 3.0  # a connected glove silent this long is closed and reconnected
 DOT_COLORS = {"ok": "#1d8a3a", "wait": "#c58a00", "fail": "#b3261e", "off": "#9aa0a6"}
 
 
@@ -1133,6 +1154,7 @@ class TeleopApp:
         self.arms_io = None
         self.teleop = None
         self.gloves = {}
+        self._glove_since = {}
         self.glove_slots = {side: _GloveSlot() for side in SIDES}
         self.imu_slots = {side: _ImuSlot() for side in SIDES}
         self._next_try = collections.defaultdict(float)
@@ -1257,20 +1279,36 @@ class TeleopApp:
                 self.gloves[side] = (glove, imu)
                 self.glove_slots[side].source = glove
                 self.imu_slots[side].attach(imu)
+                self._glove_since[side] = time.monotonic()
             glove = self.gloves[side][0]
             snapshot = glove.read()
             label = getattr(glove, "serial", None) or "synthetic glove"
             frame = snapshot.frame
+            silent = time.monotonic() - (self._glove_since[side] if frame is None
+                                         else frame.received_at)
             if snapshot.error:
                 self._set(name, "fail", f"{label}: {snapshot.error}")
-            elif frame is None:
+            elif frame is None and silent < GLOVE_RECONNECT_S:
                 self._set(name, "wait", f"{label} connected, waiting for frames")
-            elif time.monotonic() - frame.received_at < 0.3:
+            elif silent < 0.3:
                 self._set(name, "ok", f"{label} streaming")
             else:
-                self._set(name, "fail", f"{label}: no frames for "
-                          f"{time.monotonic() - frame.received_at:.1f} s",
-                          "glove asleep, off or its link dropped")
+                self._set(name, "fail", f"{label}: no frames for {silent:.1f} s",
+                          "glove asleep, off or its link dropped; reconnecting")
+            if silent >= GLOVE_RECONNECT_S:
+                # The SDK drops a glove that misses heartbeats and never brings
+                # it back: close it so the next retry opens a fresh connection.
+                self._drop_glove(side)
+
+    def _drop_glove(self, side):
+        glove, imu = self.gloves.pop(side)
+        self.glove_slots[side].source = None
+        self.imu_slots[side].source = None
+        for source in (imu, glove):
+            try:
+                source.close()
+            except Exception as exc:
+                self._log(f"{side} glove cleanup: {exc}")
 
     def input_step(self, now):
         for name, status in self.arm_input.statuses().items():
@@ -1439,9 +1477,15 @@ def _connect_glove(args, side):
     from .imu_arm_source import PalmImuArmSource, PalmImuRetargeter
     from .sources import GloveSource
 
+    from .connection_monitor import ping
+
     wuji_sdk.set_log_level("warn")
     address = args.left_glove_address if side == "left" else args.right_glove_address
     serial = args.left_glove_sn if side == "left" else args.right_glove_sn
+    # An SDK connect to a silent address holds the GIL until it times out.
+    ip = None if address is None else address.rsplit(":", 1)[0]
+    if ip is not None and not (ping(ip) or ping(ip)):
+        raise RuntimeError(f"{address} does not answer ping (glove off or asleep?)")
     glove = GloveSource(serial, args.user_id, sdk=wuji_sdk,
                         device_name=f"wuji_bimanual_glove_{side}", address=address)
     try:
@@ -1491,6 +1535,10 @@ def main(argv=None):
     parser.add_argument("--log-csv", default=time.strftime(
         "/tmp/vega-hardware-teleop-%Y%m%d-%H%M%S.csv"),
         help="Commanded and measured arm joints at 20 Hz")
+    parser.add_argument("--hand-kp", type=float, default=HAND_MIT_GAINS[0],
+                        help="Wuji finger stiffness written to both hands on connect")
+    parser.add_argument("--hand-kd", type=float, default=HAND_MIT_GAINS[1],
+                        help="Wuji finger damping written to both hands on connect")
     defaults = TeleopLimits()
     for name in ("max_arm_speed", "max_hand_speed", "reset_speed",
                  "reset_clearance", "guard_clearance"):
@@ -1501,6 +1549,8 @@ def main(argv=None):
         parser.error("--reset-shoulder-back must be between 0 and 0.6 rad")
     if not 0.0 < args.max_arm_speed <= 2.0 or not 0.0 < args.reset_speed <= 0.6:
         parser.error("arm speeds must be positive and at most 2.0 (teleop) / 0.6 (reset) rad/s")
+    if not (0.0 < args.hand_kp <= 12.0 and 0.0 <= args.hand_kd <= 1.0):
+        parser.error("--hand-kp must be in (0, 12] and --hand-kd in [0, 1]")
     if not args.fake_robot:
         for name in ("ROBOT_NAME", "ZENOH_CONFIG"):
             if not os.environ.get(name):
@@ -1513,7 +1563,8 @@ def main(argv=None):
         connect_robot, hands_io = functools.partial(FakeArms, reset_pose(0.0)), FakeHands()
     else:
         connect_robot = DexcontrolArms
-        hands_io = WujiHands({"left": args.left_hand_sn, "right": args.right_hand_sn})
+        hands_io = WujiHands({"left": args.left_hand_sn, "right": args.right_hand_sn},
+                             mit_gains=(args.hand_kp, args.hand_kd))
     if args.synthetic_input:
         connect_glove = lambda side: (SyntheticSource(side), HeldWristImu())  # noqa: E731
         arm_input = SyntheticPicoLinks()

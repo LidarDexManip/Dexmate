@@ -61,10 +61,12 @@ The hardware mode is `scripts/launch_wuji_vega_hardware_pico.sh` (moves the phys
 
 - Arm input defaults to the wrist-tracker mapping above (`ARM_INPUT=tracker`; the launcher starts the XRoboToolkit PC Service; Start calibrates at the robot's current pose). `ARM_INPUT=pico-hand` uses the bilateral Pico hand mapping and starts DexStream instead.
 - Commands stream at 100 Hz to the real arms through dexcontrol on the laptop (`requirements-wuji-hardware.txt`, robot `.dzcfg` in the repo root) and to both Wuji hands through `wuji_sdk`.
+- Finger commands are position-only (velocity and effort 0). Each hand's MIT gains are written on connect: kp 1.5 / kd 0.1 by default (`--hand-kp`/`--hand-kd`, launcher `HAND_KP`/`HAND_KD`), not saved to the hand. A left hand left at kp 12 / kd 0.3 buzzed and ran hot.
 - When the PC Service lists a tracker serial more than once (frozen leftovers of a stopped tracker), only the entry that is still updating is used.
 - A dashboard drives it: **R** reset (hand-aware collision-checked path to upper arms 0.25 rad behind vertical, forearms level), **S** start (re-anchors relative arm tracking), **P**/**Space** pause (freezes arms and hands), **Esc** software E-stop, **U** release.
 - Every teleop target is clearance-checked; a target closer than 1.5 cm is held.
 - The dashboard opens at once and shows a dot per link (robot, each hand, each glove, Pico server, each tracked hand): green working, yellow waiting, red failed with the fix. Failed links are retried; nothing exits. Controls work once the robot arms connect.
+- Links must not stall each other. `wuji_sdk` holds the GIL during `scan()` (~3 s) and `connect(sn=...)` without a prior scan (~18 s), freezing the arm loop and starving the glove streams until the SDK drops the gloves. So hand discovery runs in a child process (`wuji_scan_isolated`), hands connect by address with a 3 s timeout, and a glove is pinged before its SDK connect. A glove silent for 3 s (e.g. dropped by the SDK after missed heartbeats) is closed and reconnected.
 - A hand is never connected while its laptop source address sits on two interfaces (e.g. 192.168.1.50 on the hands port and the glove adapter): the SDK then connects from the wrong address and the failed attempt locks the hand until a 12 V power cycle.
 - `--fake-robot` rehearses with the real Pico and gloves without connecting to the robot; add `--synthetic-input` for no inputs either.
 

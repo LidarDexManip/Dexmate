@@ -1,0 +1,4 @@
+# Local browser dashboard (includes the existing arm/hand simulation dependencies).
+-r requirements-wuji-vr-sim.txt
+aiohttp==3.14.5
+scipy==1.18.1

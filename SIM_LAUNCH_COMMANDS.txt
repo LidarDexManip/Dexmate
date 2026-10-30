@@ -80,3 +80,9 @@ scripts/launch_wuji_vega_manual_arm.sh [J1 J2 J3 J4 J5 J6 J7]
 
 # --- Stop a running sim (kill only the vega_arm_sim process) ---
 # ps -eo pid,cmd | awk '/python -m wuji_teleop.vega_arm/ && !/awk/'
+
+# --- Browser end-effector dashboard (no Pico; simulation by default) ---
+scripts/launch_vega_ee_preview.sh
+# Open http://127.0.0.1:8088; optional physical glove: --glove --side right
+# Physical robot ONLY when explicitly intended: --hardware --glove --side right
+# See EE_PREVIEW_RUNBOOK.md for preview, keyboard/drag controls, and table alignment.

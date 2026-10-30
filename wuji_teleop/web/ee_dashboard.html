@@ -1,0 +1,146 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Vega · Motion Studio</title><style>
+:root{color-scheme:dark;--bg:#0e141c;--panel:#151e29;--line:#293646;--muted:#91a4b9;--ink:#e8f0f7;--teal:#50dfc2;--amber:#edbd67;--red:#ff7b7b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px system-ui,sans-serif}header{height:76px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 26px}h1{font-size:21px;margin:0;font-weight:650}h1 span{color:var(--teal)}small,.muted{color:var(--muted)}.badge{padding:7px 12px;border:1px solid #385a57;border-radius:20px;color:var(--teal);font-size:12px;letter-spacing:.08em}.layout{display:grid;grid-template-columns:280px minmax(420px,1fr) 310px;gap:16px;padding:20px;max-width:1800px;margin:auto}.panel{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:18px;margin-bottom:16px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.1em;margin:0 0 16px;color:var(--muted)}h3{font-size:15px;margin:0 0 10px}button,select,input{font:inherit}button{border:1px solid var(--line);border-radius:7px;padding:10px 12px;background:#233143;color:var(--ink);cursor:pointer}button:hover{background:#304258}button:disabled{opacity:.38;cursor:default}.primary{background:var(--teal);color:#102823;border:0;font-weight:700}.primary:hover{background:#85ecd6}.danger{border-color:#784646;color:var(--red)}.wide{width:100%;margin-top:8px}.row{display:flex;gap:8px;align-items:center;justify-content:space-between}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}label{font-size:12px;color:var(--muted)}input[type=number],select{width:100%;border:1px solid var(--line);background:#0f1721;border-radius:6px;color:var(--ink);padding:8px;margin-top:5px}input[type=checkbox]{accent-color:var(--teal)}.fields{margin:14px 0}.check{display:flex;gap:8px;align-items:flex-start;margin:12px 0;line-height:1.5}.viewer{position:relative;overflow:hidden;padding:0;min-height:350px}.viewer img{width:100%;display:block;aspect-ratio:4/3;object-fit:contain;background:#0a1017;cursor:grab;touch-action:none;user-select:none;-webkit-user-drag:none}.overlay{position:absolute;left:16px;top:16px;background:#0e141ce8;padding:7px 11px;border:1px solid var(--line);border-radius:7px;font-size:12px;pointer-events:none}.caption{display:flex;justify-content:space-between;gap:12px;padding:12px 16px;color:var(--muted);font-size:12px}.pads{display:grid;grid-template-columns:1fr 1fr;gap:14px}canvas{width:100%;height:170px;background:#101925;border:1px solid var(--line);border-radius:8px;touch-action:none;cursor:crosshair}canvas:focus{outline:2px solid var(--teal)}.notice{min-height:44px;color:var(--amber);font-size:13px;line-height:1.5;margin-top:12px}.device{padding:10px 0;border-bottom:1px solid #22303f}.device:last-child{border:0}.device strong{font-weight:500;font-size:13px}.device small{display:block;margin:3px 0 0 17px;font-size:11px;overflow-wrap:anywhere}.dot{display:inline-block;width:7px;height:7px;margin-right:9px;border-radius:50%;background:#768392}.ok{background:var(--teal)}.fail{background:var(--red)}.wait{background:var(--amber)}.log{font:12px ui-monospace,monospace;color:var(--muted);line-height:1.7;max-height:140px;overflow:auto}.keys{font-size:12px;line-height:1.9;color:var(--muted)}kbd{background:#263447;border-radius:4px;padding:2px 5px;color:var(--ink)}footer{padding:0 25px 20px;color:var(--muted);font-size:12px}@media(max-width:1150px){.layout{grid-template-columns:260px 1fr}.devices{grid-column:1/-1}.devices .panel{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.devices h2{grid-column:1/-1}}@media(max-width:730px){.layout{display:flex;flex-direction:column;padding:10px}.pads{grid-template-columns:1fr}.devices .panel{display:block}header{padding:12px;height:auto;gap:12px}.badge{font-size:10px}}
+.stage{position:relative}.stage #gizmo{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;touch-action:none;user-select:none}.gizmo-tools{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line)}.gizmo-tools select{width:auto;margin:0}.gizmo-tools label{display:flex;align-items:center;gap:7px}</style></head><body><header><div><h1><span>VEGA</span> / Motion Studio</h1><small>End-effector preview · Wuji hand control · No headset</small></div><div class="badge" id="mode">CONNECTING TO LOCAL SERVER</div></header><main class="layout"><aside><section class="panel"><h2>01 / Target</h2><label for="side">Active arm</label><select id="side"><option value="right">Right arm</option><option value="left">Left arm</option></select><div class="fields grid" id="fields"></div><small>Metres / degrees · X forward, Y left, Z up</small><button class="wide" id="current">Use current pose</button><button class="wide primary" id="preview">Preview path</button><button class="wide" id="execute" disabled>Execute reviewed path</button><div class="notice" id="notice" role="status" aria-live="polite">Loading the robot model…</div></section><section class="panel"><h2>02 / Table alignment</h2><small>30-inch tabletop · 0.762 m above floor</small><div style="margin-top:12px"><label for="base">Base origin above floor (m)</label><input id="base" type="number" value="0.15" min="0" max="2" step="0.005"></div><label class="check"><input id="verified" type="checkbox">Measured height verified on the real robot</label><button class="wide" id="table">Apply table alignment</button><p class="muted" style="font-size:12px;line-height:1.5">0.15 m is an initial model assumption. The table check extends across all X/Y; other objects are not modelled.</p></section><section class="panel"><h2>03 / Hand &amp; stop controls</h2><button class="wide" id="glove">Enable glove · arm holds</button><button class="wide" id="pause">Pause / hold <kbd>Space</kbd></button><button class="wide danger" id="estop">Software E-stop <kbd>Esc</kbd></button><button class="wide" id="release">Release software E-stop</button><p class="muted" style="font-size:12px">Fingers hold during arm execution. Use the physical E-stop for imminent contact.</p></section></aside><article><section class="panel viewer"><div class="overlay" id="state">SIMULATION / PAUSED</div><div class="stage"><img id="frame" draggable="false" alt="Full-body Vega-1U simulation with Wuji hands and a tabletop plane"><svg id="gizmo" viewBox="0 0 720 540" tabindex="0" aria-label="End effector translation arrows and rotation rings"></svg></div><div class="gizmo-tools"><label>Gizmo <select id="gizmoMode"><option value="translate">Translate</option><option value="rotate">Rotate</option></select></label><label>Axes <select id="gizmoSpace"><option value="local">End effector</option><option value="world">World</option></select></label><small>Drag an arrow or ring · Shift = fine</small></div><div class="caption"><span>Drag to orbit · Scroll to zoom · Double-click to reset</span><button id="overview">Full-body view</button></div></section><section class="panel"><h2>Move the preview target</h2><div class="pads"><div><h3>Top view · X / Y</h3><canvas id="top" width="400" height="170" tabindex="0" aria-label="Drag target in the X Y plane"></canvas></div><div><h3>Side view · X / Z</h3><canvas id="sidepad" width="400" height="170" tabindex="0" aria-label="Drag target in the X Z plane"></canvas></div></div><p class="keys">Click a target pad, then use <kbd>↑ ↓ ← →</kbd> for X/Y, <kbd>PgUp PgDn</kbd> for Z.<br><kbd>I / K</kbd> roll · <kbd>J / L</kbd> pitch · <kbd>U / O</kbd> yaw · Hold <kbd>Shift</kbd> for fine steps.</p><small>The teal marker is your requested target. Releasing a drag or finishing a key edit previews the path; it never executes it.</small></section><section class="panel"><h2>Activity</h2><div id="log" class="log"></div></section></article><aside class="devices"><section class="panel"><h2>Components</h2><small>Network replies and live streams are reported separately.</small><div id="components"></div></section></aside></main><footer>Full Vega-1U URDF + Wuji hands · Right hand mount +90° (palm toward robot left at neutral) · Base, lift, torso and head fixed · Local dashboard</footer><script>
+const key='__SESSION_KEY__', $=id=>document.getElementById(id);let state=null,target=[0,0,0,0,0,0],origin=[0,0,0],dirty=true,revision=0,timer=null,connected=false,lastURL=null;
+const names=['X','Y','Z','Roll','Pitch','Yaw'];names.forEach((name,i)=>{const l=document.createElement('label');l.textContent=name;const e=document.createElement('input');e.type='number';e.step=i<3?'0.005':'2';e.id='t'+i;e.setAttribute('aria-label',name);e.addEventListener('input',()=>{target[i]=Number(e.value);edited();schedule()});l.append(e);$('fields').append(l)});
+function showTarget(){target.forEach((v,i)=>$('t'+i).value=v.toFixed(i<3?5:2));draw();drawGizmo()}
+function edited(){dirty=true;revision++;$('execute').disabled=true;draw();drawGizmo()}
+function notice(text){$('notice').textContent=text}
+async function api(name,data){const r=await fetch('/api/'+name,{method:data===undefined?'GET':'POST',headers:{'X-Session-Key':key,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});if(!r.ok){let b;try{b=await r.json()}catch{throw Error('Local server unavailable')}throw Error(b.error||'Request refused')}return r.json()}
+function apply(s){state=s;connected=true;$('mode').textContent=s.hardware?'PHYSICAL ROBOT':'SIMULATION ONLY · NO ROBOT COMMANDS';$('state').textContent=(s.hardware?'HARDWARE':'SIMULATION')+' / '+s.state.toUpperCase()+(s.preview_id?(s.ready?' / PREVIEW READY':' / PREVIEW PLAYBACK'):'');$('side').value=s.side;$('side').disabled=s.side_locked;$('execute').disabled=s.blocked||dirty||!s.ready||s.state!=='paused';$('preview').disabled=s.blocked;$('glove').disabled=s.blocked;$('release').disabled=s.blocked;if(s.blocked)notice('READ-ONLY: '+s.block_reason+'. Restore the missing hand, then restart.');$('log').textContent=s.messages.join('\n');$('components').replaceChildren();for(const [name,[level,detail]] of Object.entries(s.components)){const row=document.createElement('div');row.className='device';const dot=document.createElement('span');dot.className='dot '+level;const title=document.createElement('strong');title.textContent=name;const small=document.createElement('small');small.textContent=detail;row.append(dot,title,small);$('components').append(row)}}
+async function command(name,data={}){try{const s=await api(name,data);apply(s);return s}catch(e){notice(e.message);throw e}}
+function schedule(){clearTimeout(timer);timer=setTimeout(()=>preview().catch(()=>{}),250)}
+async function preview(){clearTimeout(timer);const rev=revision;dirty=true;$('execute').disabled=true;notice('Solving IK and checking the entire path…');try{const s=await command('preview',{target,base_height:Number($('base').value),table_verified:$('verified').checked});if(rev===revision){dirty=false;apply(s);notice('Playing the checked path. Review the motion before Execute.')}}catch(e){dirty=true;notice('Preview rejected: '+e.message)}}
+$('preview').onclick=()=>preview().catch(()=>{});
+$('execute').onclick=async()=>{if(dirty||!state?.ready)return;if(state.hardware&&!confirm('Execute this path on the physical robot? Confirm the entire path is clear.'))return;try{await command('execute',{preview_id:state.preview_id});dirty=true;notice('Executing reviewed path. Space pauses; Esc requests E-stop.')}catch{}};
+$('current').onclick=async()=>{try{clearTimeout(timer);const s=await command('current');target=s.target;origin=target.slice(0,3);edited();showTarget();notice('Current pose loaded. Edit a target or drag a teal marker.')}catch{}};
+$('side').onchange=async()=>{try{clearTimeout(timer);const s=await command('side',{side:$('side').value});target=s.target;origin=target.slice(0,3);edited();showTarget()}catch{if(state)$('side').value=state.side}};
+$('base').oninput=()=>{edited();$('verified').checked=false};$('verified').onchange=()=>edited();
+$('table').onclick=async()=>{try{clearTimeout(timer);await command('table',{height:Number($('base').value),verified:$('verified').checked});edited();notice('Table alignment applied. Preview again.')}catch{}};
+for(const name of ['pause','estop','release','glove'])$(name).onclick=async()=>{clearTimeout(timer);edited();try{await command(name);notice(name==='glove'?'Glove enabled; arm holds.':'Control request sent.')}catch{}};
+const axes={ArrowUp:[0,1],ArrowDown:[0,-1],ArrowLeft:[1,1],ArrowRight:[1,-1],PageUp:[2,1],PageDown:[2,-1],i:[3,1],k:[3,-1],j:[4,1],l:[4,-1],u:[5,1],o:[5,-1]};
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();$('estop').click();return}if(e.code==='Space'&&!['INPUT','SELECT'].includes(e.target.tagName)){e.preventDefault();$('pause').click();return}if(['INPUT','SELECT','BUTTON'].includes(e.target.tagName))return;const a=axes[e.key]||axes[e.key.toLowerCase()];if(!a)return;e.preventDefault();if(state?.state!=='paused'){notice('Pause before editing a target.');return}target[a[0]]+=a[1]*(a[0] < 3 ? .005 : 2) * (e.shiftKey ? .2 : 1);edited();showTarget();schedule()});
+function draw(){for(const [id,plane] of [['top','top'],['sidepad','side']]){const c=$(id),g=c.getContext('2d'),w=c.width,h=c.height;g.clearRect(0,0,w,h);g.strokeStyle='#344559';g.beginPath();g.moveTo(w/2,0);g.lineTo(w/2,h);g.moveTo(0,h/2);g.lineTo(w,h/2);g.stroke();g.fillStyle='#a2b7cc';g.font='12px system-ui';g.fillText(plane==='top'?'+X ↑    +Y ←':'+Z ↑    +X →',10,18);const d=target.map((v,i)=>(v-(origin[i]||0))*400),x=w/2+(plane==='top'?-d[1]:d[0]),y=h/2-(plane==='top'?d[0]:d[2]);g.fillStyle='#50dfc2';g.beginPath();g.arc(x,y,7,0,2*Math.PI);g.fill()}}
+for(const [id,plane] of [['top','top'],['sidepad','side']]){const c=$(id);let dragging=false;function move(e){if(!dragging)return;const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*c.width/r.width,y=(e.clientY-r.top)*c.height/r.height,a=(x-c.width/2)/400,b=(c.height/2-y)/400;if(plane==='top'){target[0]=origin[0]+b;target[1]=origin[1]-a}else{target[0]=origin[0]+a;target[2]=origin[2]+b}edited();showTarget()}
+c.onpointerdown=e=>{if(state?.state!=='paused'){notice('Pause before dragging.');return}clearTimeout(timer);c.focus();c.setPointerCapture(e.pointerId);dragging=true;move(e)};c.onpointermove=move;c.onpointerup=e=>{if(!dragging)return;move(e);dragging=false;schedule()};c.onpointercancel=()=>dragging=false}
+let camera={azimuth:135,elevation:-15,distance:2.8},orbit=null,cameraDirty=false,cameraBusy=false,cameraCooling=false;
+const view=$('frame');
+// Send during motion, retaining only the newest pose while one request is in flight.
+function sendCamera(){cameraDirty=true;pumpCamera()}
+async function pumpCamera(){
+ if(cameraBusy||cameraCooling||!cameraDirty)return;
+ cameraDirty=false;cameraBusy=true;
+ try{await api('camera',{...camera})}catch(e){notice('Camera update failed: '+e.message)}
+ finally{cameraBusy=false;cameraCooling=true;setTimeout(()=>{cameraCooling=false;pumpCamera()},30)}
+}
+function finishOrbit(e){
+ if(!orbit||e.pointerId!==orbit.id)return;
+ orbit=null;view.style.cursor='grab';
+ if(view.hasPointerCapture(e.pointerId))view.releasePointerCapture(e.pointerId);
+}
+view.ondragstart=e=>e.preventDefault();
+view.onpointerdown=e=>{
+ if(gizmoDrag)return;
+ if(e.button!==0||e.isPrimary===false)return;
+ e.preventDefault();orbit={id:e.pointerId,x:e.clientX,y:e.clientY};
+ view.setPointerCapture(e.pointerId);view.style.cursor='grabbing';
+};
+view.onpointermove=e=>{
+ if(!orbit||e.pointerId!==orbit.id)return;
+ e.preventDefault();const scale=180/Math.max(view.clientWidth,320);
+ camera.azimuth+=(e.clientX-orbit.x)*scale;
+ camera.elevation=Math.max(-85,Math.min(85,camera.elevation+(e.clientY-orbit.y)*scale));
+ orbit.x=e.clientX;orbit.y=e.clientY;sendCamera();
+};
+view.onpointerup=finishOrbit;view.onpointercancel=finishOrbit;
+view.onlostpointercapture=()=>{orbit=null;view.style.cursor='grab'};
+window.addEventListener('blur',()=>{orbit=null;view.style.cursor='grab'});
+view.addEventListener('wheel',e=>{
+ e.preventDefault();if(gizmoDrag)return;const pixels=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?view.clientHeight:1);
+ camera.distance=Math.max(.5,Math.min(5,camera.distance*Math.exp(Math.max(-100,Math.min(100,pixels))*.0015)));
+ sendCamera();
+},{passive:false});
+function resetCamera(){camera={azimuth:135,elevation:-15,distance:2.8};sendCamera()}
+$('overview').onclick=resetCamera;view.ondblclick=resetCamera;
+async function states(){try{const s=await api('state');if(!state){target=s.target;origin=target.slice(0,3);showTarget();$('base').value=s.base_height;notice('Ready. Move the target with the pads or keyboard, then review the preview.')}apply(s)}catch(e){connected=false;$('execute').disabled=true;$('mode').textContent='LOCAL SERVER DISCONNECTED';notice(e.message)}setTimeout(states,300)}
+async function frames(){try{const r=await fetch('/api/frame',{headers:{'X-Session-Key':key}});if(r.ok){const u=URL.createObjectURL(await r.blob());$('frame').src=u;const metadata=r.headers.get('X-View-Projection');if(metadata){frameProjection=JSON.parse(metadata);drawGizmo()}if(lastURL)URL.revokeObjectURL(lastURL);lastURL=u}}catch{}setTimeout(frames,orbit||cameraBusy||cameraDirty?20:140)}
+const GizmoMath=(()=>{
+ const add=(a,b)=>a.map((v,i)=>v+b[i]), sub=(a,b)=>a.map((v,i)=>v-b[i]), mul=(a,k)=>a.map(v=>v*k),dot=(a,b)=>a.reduce((v,x,i)=>v+x*b[i],0);
+ const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+ const unit=a=>{const n=Math.hypot(...a);return n>1e-9?mul(a,1/n):null};
+ const identity=()=>[[1,0,0],[0,1,0],[0,0,1]];
+ const mm=(a,b)=>a.map(row=>[0,1,2].map(j=>row.reduce((s,v,k)=>s+v*b[k][j],0)));
+ const column=(m,j)=>m.map(row=>row[j]);
+ function rotation(v){const [x,y,z]=v.map(a=>a*Math.PI/180),cx=Math.cos(x),sx=Math.sin(x),cy=Math.cos(y),sy=Math.sin(y),cz=Math.cos(z),sz=Math.sin(z);return [[cz*cy,cz*sy*sx-sz*cx,cz*sy*cx+sz*sx],[sz*cy,sz*sy*sx+cz*cx,sz*sy*cx-cz*sx],[-sy,cy*sx,cy*cx]]}
+ function euler(m){const p=Math.asin(Math.max(-1,Math.min(1,-m[2][0]))),c=Math.cos(p);return [Math.abs(c)>1e-7?Math.atan2(m[2][1],m[2][2]):Math.atan2(-m[1][2],m[1][1]),p,Math.abs(c)>1e-7?Math.atan2(m[1][0],m[0][0]):0].map(v=>v*180/Math.PI)}
+ function rotate(m,axis,angle){const [x,y,z]=axis,c=Math.cos(angle),s=Math.sin(angle),t=1-c;return mm([[t*x*x+c,t*x*y-s*z,t*x*z+s*y],[t*x*y+s*z,t*y*y+c,t*y*z-s*x],[t*x*z-s*y,t*y*z+s*x,t*z*z+c]],m)}
+ function project(p,c){const v=sub(p,c.position),z=dot(v,c.forward);if(z<.01)return null;const right=unit(cross(c.forward,c.up));return [c.width/2+(dot(v,right)/z-c.shift_x)*c.height/(2*c.tan_y),c.height/2-(dot(v,c.up)/z-c.shift_y)*c.height/(2*c.tan_y)]}
+ function ray(x,y,c){const right=unit(cross(c.forward,c.up));return {origin:c.position,dir:unit(add(c.forward,add(mul(right,(x-c.width/2)*2*c.tan_y/c.height+c.shift_x),mul(c.up,(c.height/2-y)*2*c.tan_y/c.height+c.shift_y))))}}
+ function lineParameter(ray,p,axis){const b=dot(axis,ray.dir),den=1-b*b;if(den<.015)return null;const w=sub(p,ray.origin);return (b*dot(ray.dir,w)-dot(axis,w))/den}
+ function planeVector(ray,p,axis){const den=dot(ray.dir,axis);if(Math.abs(den)<.08)return null;const t=dot(sub(p,ray.origin),axis)/den;if(t<=0)return null;return unit(sub(add(ray.origin,mul(ray.dir,t)),p))}
+ return {add,sub,mul,dot,cross,unit,identity,column,rotation,euler,rotate,project,ray,lineParameter,planeVector};
+})();
+
+let frameProjection=null,gizmoDrag=null;
+const gizmo=$('gizmo'),gizmoColors=['#ff6464','#57e18a','#58a6ff'];
+function gizmoMode(){return $('gizmoMode').value}
+function gizmoBasis(){return $('gizmoSpace').value==='local'?GizmoMath.rotation(target.slice(3)):GizmoMath.identity()}
+function drawGizmo(){
+ gizmo.replaceChildren();if(!frameProjection)return;
+ const m=GizmoMath,c=frameProjection,p=target.slice(0,3),center=m.project(p,c);if(!center)return;
+ const basis=gizmoBasis(),size=.13,ns='http://www.w3.org/2000/svg';
+ function element(tag,attrs){const e=document.createElementNS(ns,tag);for(const [k,v]of Object.entries(attrs))e.setAttribute(k,String(v));gizmo.append(e);return e}
+ for(let i=0;i<3;i++){
+  const axis=m.column(basis,i),color=gizmoColors[i];
+  if(gizmoMode()==='translate'){
+   const tip=m.project(m.add(p,m.mul(axis,size)),c);if(!tip)continue;
+   const dx=tip[0]-center[0],dy=tip[1]-center[1],length=Math.hypot(dx,dy);if(length<10)continue;
+   element('line',{x1:center[0],y1:center[1],x2:tip[0],y2:tip[1],stroke:color,'stroke-width':4,'pointer-events':'none'});
+   const ux=dx/length,uy=dy/length;
+   element('polygon',{points:`${tip[0]},${tip[1]} ${tip[0]-ux*12-uy*5},${tip[1]-uy*12+ux*5} ${tip[0]-ux*12+uy*5},${tip[1]-uy*12-ux*5}`,fill:color,'pointer-events':'none'});
+   element('line',{x1:center[0]+ux*10,y1:center[1]+uy*10,x2:tip[0],y2:tip[1],stroke:'transparent','stroke-width':18,'data-axis':i,'pointer-events':'stroke',cursor:'move'});
+   const label=element('text',{x:tip[0]+ux*12,y:tip[1]+uy*12,fill:color,'font-size':15,'font-weight':'bold','text-anchor':'middle','pointer-events':'none'});label.textContent=['X','Y','Z'][i];
+  }else{
+   const u=m.column(basis,(i+1)%3),v=m.column(basis,(i+2)%3),points=[];
+   for(let k=0;k<=72;k++){const a=k*2*Math.PI/72,pt=m.project(m.add(p,m.add(m.mul(u,size*Math.cos(a)),m.mul(v,size*Math.sin(a)))),c);if(pt)points.push(pt.join(','))}
+   if(points.length!==73)continue;
+   element('polyline',{points:points.join(' '),fill:'none',stroke:color,'stroke-width':3,'pointer-events':'none'});
+   element('polyline',{points:points.join(' '),fill:'none',stroke:'transparent','stroke-width':14,'data-axis':i,'pointer-events':'stroke',cursor:'grab'});
+  }
+ }
+ element('circle',{cx:center[0],cy:center[1],r:4,fill:'white','pointer-events':'none'});
+}
+function gizmoPoint(e){const b=gizmo.getBoundingClientRect();return [(e.clientX-b.left)*720/b.width,(e.clientY-b.top)*540/b.height]}
+gizmo.onpointerdown=e=>{
+ const index=e.target.dataset.axis;if(index===undefined||e.button!==0)return;
+ e.preventDefault();e.stopPropagation();
+ if(state?.state!=='paused'||state.blocked){notice('Pause and resolve missing devices before editing a target.');return}
+ if(cameraBusy||cameraDirty){notice('Wait for the camera to settle, then drag an axis.');return}
+ const m=GizmoMath,axis=m.column(gizmoBasis(),Number(index)),p=target.slice(0,3),c=frameProjection,xy=gizmoPoint(e),ray=m.ray(...xy,c),mode=gizmoMode();
+ const start=mode==='translate'?m.lineParameter(ray,p,axis):m.planeVector(ray,p,axis);
+ if(start===null){notice('This axis is edge-on to the camera. Orbit the view and try again.');return}
+ clearTimeout(timer);gizmoDrag={id:e.pointerId,axis,p,c,start,mode,target:target.slice(),matrix:m.rotation(target.slice(3))};
+ gizmo.setPointerCapture(e.pointerId);gizmo.focus();edited();notice(`Dragging ${['X','Y','Z'][index]} ${mode==='translate'?'translation':'rotation'} — preview only.`);
+};
+gizmo.onpointermove=e=>{
+ if(!gizmoDrag||gizmoDrag.id!==e.pointerId)return;e.preventDefault();
+ const d=gizmoDrag,m=GizmoMath,ray=m.ray(...gizmoPoint(e),d.c),fine=e.shiftKey ? .2 : 1;
+ if(d.mode==='translate'){
+  const value=m.lineParameter(ray,d.p,d.axis);if(value===null)return;
+  const delta=Math.max(-.3,Math.min(.3,(value-d.start)*fine));
+  target=[...m.add(d.p,m.mul(d.axis,delta)),...d.target.slice(3)];
+ }else{
+  const vector=m.planeVector(ray,d.p,d.axis);if(!vector)return;
+  const angle=Math.atan2(m.dot(d.axis,m.cross(d.start,vector)),m.dot(d.start,vector))*fine;
+  target=[...d.p,...m.euler(m.rotate(d.matrix,d.axis,angle))];
+ }
+ edited();showTarget();drawGizmo();
+};
+function finishGizmo(e,cancel=false){if(!gizmoDrag||gizmoDrag.id!==e.pointerId)return;const old=gizmoDrag;gizmoDrag=null;if(gizmo.hasPointerCapture(e.pointerId))gizmo.releasePointerCapture(e.pointerId);if(cancel){target=old.target;edited();showTarget();drawGizmo()}else schedule()}
+gizmo.onpointerup=e=>finishGizmo(e);gizmo.onpointercancel=e=>finishGizmo(e,true);
+gizmo.onlostpointercapture=e=>{if(gizmoDrag)finishGizmo(e,true)};
+window.addEventListener('blur',()=>{if(gizmoDrag)finishGizmo({pointerId:gizmoDrag.id},true)});
+$('gizmoMode').onchange=drawGizmo;$('gizmoSpace').onchange=drawGizmo;
+
+states();frames();draw();
+</script></body></html>

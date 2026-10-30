@@ -24,7 +24,13 @@ def convert_mesh(source: Path, destination: Path) -> None:
 
     loaded = trimesh.load(source, force="scene")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    loaded.export(destination)
+    # MuJoCo's OBJ loader does not retain all face groups from a Scene export.
+    # Bake transforms and flatten to one mesh before writing a single OBJ object.
+    mesh = loaded.to_geometry()
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise ValueError(f"Expected triangle meshes in {source}")
+    destination.write_text(trimesh.exchange.obj.export_obj(
+        mesh, include_texture=False, include_color=False), encoding="utf-8")
 
 
 def add_environment(tree: ET.ElementTree) -> None:
@@ -117,7 +123,7 @@ def build_mjcf() -> Path:
         if not source.exists():
             raise FileNotFoundError(f"Mesh referenced by URDF was not found: {source}")
         if source.suffix.lower() == ".glb":
-            destination = CACHE_DIR / "meshes" / f"{source.stem}.obj"
+            destination = CACHE_DIR / "meshes" / f"{source.stem}.merged.obj"
             if not destination.exists() or destination.stat().st_mtime < source.stat().st_mtime:
                 convert_mesh(source, destination)
             mesh.set("file", str(destination))
