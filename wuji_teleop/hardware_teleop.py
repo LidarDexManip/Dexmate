@@ -42,6 +42,7 @@ import numpy as np
 
 from .collision_check import (
     ArmClearanceChecker, PathFollower, PlanningError, ResetPlanner, join_arms, split_arms)
+from .latency import AsyncCsvLogger, LatencyRecorder
 from .retarget import TrackingController
 from .sources import SourceSnapshot, SyntheticSource
 from .vega_arm_sim import (
@@ -511,6 +512,9 @@ class TrackerArmMapping:
             left_serial=left_serial, right_serial=right_serial)
         self._anchor = None
         self.status = {side: "not started" for side in SIDES}
+        self.last_source_revision = None
+        self.last_source_received_at = None
+        self.last_tracker_timestamp_ns = None
 
     def recenter(self, q):
         self._anchor = _copy(q)
@@ -518,6 +522,10 @@ class TrackerArmMapping:
 
     def update(self, q, now):
         snapshot = self.source.read()
+        self.last_source_revision = snapshot.revision
+        if snapshot.frame is not None:
+            self.last_source_received_at = snapshot.frame.received_at
+            self.last_tracker_timestamp_ns = snapshot.frame.timestamp_ns
         if self._anchor is not None:
             try:
                 self.mapper.calibrate(snapshot, self._anchor, now)
@@ -547,6 +555,8 @@ class _HandGoal:
 @dataclass
 class TeleopLimits:
     max_arm_speed: float = 1.0       # rad/s per joint while following
+    proximal_speed: float | None = None  # joints 1-4; None preserves max_arm_speed
+    wrist_speed: float | None = None     # joints 5-7; None preserves max_arm_speed
     max_hand_speed: float = 5.0      # rad/s per finger joint
     reset_speed: float = 0.30        # rad/s peak per joint during reset
     reset_acceleration: float = 0.60
@@ -554,6 +564,11 @@ class TeleopLimits:
     guard_clearance: float = 0.015   # m, teleop targets closer than this are held
     tracking_lag_warning: float = 0.30  # rad between command and measured: warn once
     tracking_fault: float | None = None  # rad; set to stop and hold instead (off by default)
+
+    def arm_speed_step(self):
+        proximal = self.max_arm_speed if self.proximal_speed is None else self.proximal_speed
+        wrist = self.max_arm_speed if self.wrist_speed is None else self.wrist_speed
+        return np.array([proximal] * 4 + [wrist] * 3, dtype=np.float64) / ARM_RATE_HZ
 
 
 class HardwareTeleop:
@@ -566,7 +581,8 @@ class HardwareTeleop:
     def __init__(self, arms_io, hands_io, mapping, glove_sources, retargeters,
                  guard_checker, planner, reset_q, *, arm_lower, arm_upper,
                  hand_lower, hand_upper, limits=None, clock=time.monotonic,
-                 threaded_planning=True, log_csv=None):
+                 threaded_planning=True, log_csv=None, latency_report=None,
+                 latency_recorder=None, perf_clock=time.monotonic):
         self.arms_io, self.hands_io = arms_io, hands_io
         self.mapping = mapping
         self.glove_sources, self.retargeters = glove_sources, retargeters
@@ -576,15 +592,34 @@ class HardwareTeleop:
         self.hand_lower, self.hand_upper = _copy(hand_lower), _copy(hand_upper)
         self.limits = limits or TeleopLimits()
         self.clock = clock
+        self.perf_clock = perf_clock
         self.threaded_planning = threaded_planning
+        self.latency = latency_recorder
+        if self.latency is None and latency_report:
+            self.latency = LatencyRecorder(latency_report, configuration={
+                "arm_rate_hz": ARM_RATE_HZ,
+                "teleop_rate_hz": TELEOP_RATE_HZ,
+                "proximal_speed_rad_s": float(
+                    self.limits.max_arm_speed if self.limits.proximal_speed is None
+                    else self.limits.proximal_speed),
+                "wrist_speed_rad_s": float(
+                    self.limits.max_arm_speed if self.limits.wrist_speed is None
+                    else self.limits.wrist_speed),
+            })
         self._lag_warned = False
         self._csv = None
         self._csv_ticks = 0
         if log_csv:
-            self._csv = open(log_csv, "w", encoding="utf-8")
-            self._csv.write("t,state," + ",".join(
-                f"{kind}_{side[0]}{i}" for kind in ("cmd", "meas") for side in SIDES
-                for i in range(1, 8)) + "\n")
+            timing_fields = (
+                "tracker_revision", "tracker_timestamp_ns", "source_received_at",
+                "mapping_started_at", "mapping_finished_at", "command_sent_at",
+                "measured_received_at", "arm_read_ms", "arm_write_ms", "io_duration_ms")
+            joint_fields = (
+                f"{kind}_{side[0]}{i}" for kind in ("goal", "cmd", "meas")
+                for side in SIDES for i in range(1, 8))
+            header = "t,state," + ",".join(
+                (*timing_fields, *joint_fields)) + "\n"
+            self._csv = AsyncCsvLogger(log_csv, header)
         self._lock = threading.RLock()
         self.messages = collections.deque(maxlen=8)
         self.state = "paused"
@@ -594,6 +629,9 @@ class HardwareTeleop:
         self.command = {side: np.clip(measured[side], self.arm_lower[side], self.arm_upper[side])
                         for side in SIDES}
         self.goal = _copy(self.command)
+        self._mapping_telemetry = {
+            "revision": None, "tracker_timestamp_ns": None,
+            "source_received_at": None, "started_at": None, "finished_at": None}
         # A hand that is not connected yet is modelled open until sync_hand().
         hands = hands_io.positions()
         self.hand_command = {side: np.clip(np.zeros(20) if hands[side] is None else hands[side],
@@ -744,14 +782,18 @@ class HardwareTeleop:
                       f"{self.planner.checks} clearance checks).")
 
     # IO thread -----------------------------------------------------------
-    def io_step(self):
+    def io_step(self, *, send_hands=True):
+        io_started = self.perf_clock()
         with self._lock:
             pending = list(self._pending)
             self._pending.clear()
         for name, value in pending:
             if name == "estop":
                 self.arms_io.set_estop(value)
+        arm_read_started = self.perf_clock()
         measured = self.arms_io.positions()
+        measured_received_at = self.perf_clock()
+        arm_read_s = measured_received_at - arm_read_started
         flags = self.arms_io.estop()
         now = self.clock()
         with self._lock:
@@ -779,17 +821,50 @@ class HardwareTeleop:
                 self._step_reset(now, measured)
             elif self.state == "running":
                 self.command = _slew(self.command, self.goal,
-                                     self.limits.max_arm_speed / ARM_RATE_HZ)
+                                     self.limits.arm_speed_step())
                 self.hand_command = _slew(self.hand_command, self.hand_goal,
                                           self.limits.max_hand_speed / ARM_RATE_HZ)
                 self._check_tracking(measured)
             arm_command = _copy(self.command)
             hand_command = _copy(self.hand_command)
+            goal = _copy(self.goal)
+            mapping_telemetry = dict(self._mapping_telemetry)
             state = self.state
-        self._write_log(now, state, arm_command, measured)
+        arm_write_started = self.perf_clock()
         self.arms_io.command(arm_command)
+        command_sent_at = self.perf_clock()
+        arm_write_s = command_sent_at - arm_write_started
+        if send_hands:
+            self._send_hands(hand_command)
+        io_finished = self.perf_clock()
+        self._write_log(
+            now, state, goal, arm_command, measured, mapping_telemetry,
+            command_sent_at=command_sent_at, measured_received_at=measured_received_at,
+            arm_read_s=arm_read_s, arm_write_s=arm_write_s,
+            io_duration_s=io_finished - io_started)
+        if self.latency is not None:
+            self.latency.record_io(
+                state=state, goal=goal, command=arm_command, measured=measured,
+                command_sent_at=command_sent_at,
+                measured_received_at=measured_received_at,
+                arm_read_s=arm_read_s, arm_write_s=arm_write_s,
+                io_duration_s=io_finished - io_started)
+
+    def _send_hands(self, hand_command):
+        started = self.perf_clock()
         for side in SIDES:
             self.hands_io.command(side, hand_command[side])
+        if self.latency is not None:
+            self.latency.record_hand_write(self.perf_clock() - started)
+
+    def hand_io_step(self):
+        """Stream hands separately so a slow hand call cannot delay arm writes."""
+        with self._lock:
+            command = _copy(self.hand_command)
+        self._send_hands(command)
+
+    def _arm_io_step(self):
+        self.io_step(send_hands=False)
 
     def _step_reset(self, now, measured):
         if self._check_tracking(measured):
@@ -803,14 +878,30 @@ class HardwareTeleop:
             self.state = "paused"
             self._log("At the reset pose. Hold forearms forward, palms down, then Start (S).")
 
-    def _write_log(self, now, state, command, measured):
-        """Commanded and measured arm joints at 20 Hz, for diagnosing motion."""
+    def _write_log(self, now, state, goal, command, measured, mapping,
+                   *, command_sent_at, measured_received_at, arm_read_s,
+                   arm_write_s, io_duration_s):
+        """Source, mapping, goal, command and measured telemetry at 20 Hz."""
         self._csv_ticks += 1
         if self._csv is None or self._csv_ticks % 5:
             return
-        values = [command[side] for side in SIDES] + [measured[side] for side in SIDES]
-        self._csv.write(f"{now:.3f},{state}," + ",".join(
-            f"{v:.4f}" for q in values for v in q) + "\n")
+        def optional(value, precision=6):
+            return "" if value is None else f"{value:.{precision}f}"
+
+        timing = [
+            "" if mapping["revision"] is None else str(mapping["revision"]),
+            "" if mapping["tracker_timestamp_ns"] is None else
+            str(mapping["tracker_timestamp_ns"]),
+            optional(mapping["source_received_at"]), optional(mapping["started_at"]),
+            optional(mapping["finished_at"]), optional(command_sent_at),
+            optional(measured_received_at), optional(arm_read_s * 1000.0, 3),
+            optional(arm_write_s * 1000.0, 3), optional(io_duration_s * 1000.0, 3),
+        ]
+        values = ([goal[side] for side in SIDES] +
+                  [command[side] for side in SIDES] +
+                  [measured[side] for side in SIDES])
+        self._csv.write(f"{now:.3f},{state}," + ",".join(timing) + "," +
+                        ",".join(f"{v:.4f}" for q in values for v in q) + "\n")
 
     def _check_tracking(self, measured):
         error = max(float(np.max(np.abs(measured[side] - self.command[side])))
@@ -856,7 +947,9 @@ class HardwareTeleop:
             target = fingers[side].hand.target
             hand_goal[side] = (hand_command[side] if target is None else
                                np.clip(target, self.hand_lower[side], self.hand_upper[side]))
+        mapping_started_at = self.perf_clock()
         goals = self.mapping.update(command, now)
+        mapping_finished_at = self.perf_clock()
         goal = {side: goals.get(side, command[side]) for side in SIDES}
         for side in SIDES:
             self.guard_checker.set_fingers(side, hand_goal[side])
@@ -870,11 +963,29 @@ class HardwareTeleop:
             if self.state != "running" or self.fingers is not fingers:
                 return
             self.goal, self.hand_goal = _copy(goal), _copy(hand_goal)
+            self._mapping_telemetry = {
+                "revision": getattr(self.mapping, "last_source_revision", None),
+                "tracker_timestamp_ns": getattr(
+                    self.mapping, "last_tracker_timestamp_ns", None),
+                "source_received_at": getattr(
+                    self.mapping, "last_source_received_at", None),
+                "started_at": mapping_started_at,
+                "finished_at": mapping_finished_at,
+            }
             self.clearance = clearance
             if held and not self._guard_holding:
                 self._log(f"Guard: holding, {clearance.distance_m * 100:.1f} cm "
                           f"({clearance.pair}). Move back to continue.")
             self._guard_holding = held
+        if self.latency is not None:
+            self.latency.record_mapping(
+                revision=getattr(self.mapping, "last_source_revision", None),
+                tracker_timestamp_ns=getattr(
+                    self.mapping, "last_tracker_timestamp_ns", None),
+                source_received_at=getattr(
+                    self.mapping, "last_source_received_at", None),
+                started_at=mapping_started_at, finished_at=mapping_finished_at,
+                goal=goal)
 
     # Threads and status --------------------------------------------------
     def _loop(self, step, rate):
@@ -897,13 +1008,17 @@ class HardwareTeleop:
             if delay > 0:
                 time.sleep(delay)
             else:
+                if self.latency is not None and step.__name__ == "_arm_io_step":
+                    self.latency.record_deadline_miss(-delay)
                 next_tick = time.monotonic()
 
     def start(self):
         self._running = True
         self._threads = [
-            threading.Thread(target=self._loop, args=(self.io_step, ARM_RATE_HZ),
+            threading.Thread(target=self._loop, args=(self._arm_io_step, ARM_RATE_HZ),
                              name="teleop-io", daemon=True),
+            threading.Thread(target=self._loop, args=(self.hand_io_step, ARM_RATE_HZ),
+                             name="teleop-hands", daemon=True),
             threading.Thread(target=self._loop, args=(self.teleop_step, TELEOP_RATE_HZ),
                              name="teleop-map", daemon=True),
         ]
@@ -920,6 +1035,13 @@ class HardwareTeleop:
         if self._csv is not None:
             self._csv.close()
             self._csv = None
+        if self.latency is not None:
+            try:
+                self.latency.close()
+            except Exception as exc:
+                self._log(f"Warning: could not write latency report: {exc}")
+                print(f"Could not write latency report {self.latency.path}: {exc}",
+                      file=sys.stderr, flush=True)
 
     def status(self):
         with self._lock:
@@ -1134,13 +1256,15 @@ class TeleopApp:
     """
 
     def __init__(self, *, connect_robot, hands_io, connect_glove, arm_input, retargeters,
-                 reset_q, limits, retry_s=5.0, start_teleop=True, log_csv=None):
+                 reset_q, limits, retry_s=5.0, start_teleop=True, log_csv=None,
+                 latency_report=None):
         self.connect_robot, self.hands_io = connect_robot, hands_io
         self.connect_glove, self.arm_input = connect_glove, arm_input
         self.retargeters, self.reset_q, self.limits = retargeters, reset_q, limits
         self.retry_s = float(retry_s)
         self.start_teleop = start_teleop
         self.log_csv = log_csv
+        self.latency_report = latency_report
         self.model, self.data, self.arms, self.hand_models = load_bimanual_scene()
         self.planner = ResetPlanner(
             ArmClearanceChecker(self.model, self.arms, self.hand_models),
@@ -1214,7 +1338,8 @@ class TeleopApp:
             arm_upper={side: self.arms[side].upper for side in SIDES},
             hand_lower={side: self.hand_models[side].lower for side in SIDES},
             hand_upper={side: self.hand_models[side].upper for side in SIDES},
-            limits=self.limits, log_csv=self.log_csv)
+            limits=self.limits, log_csv=self.log_csv,
+            latency_report=self.latency_report)
         if self.start_teleop:
             teleop.start()
         self.teleop = teleop
@@ -1377,10 +1502,10 @@ class TeleopApp:
 class Dashboard:
     """Tk window: state banner, command buttons with shortcuts, link dots, status."""
 
-    def __init__(self, app, title="Vega-1U Pico + Wuji teleop"):
+    def __init__(self, app, title="Vega-1U Pico + Wuji teleop", cameras=None):
         import tkinter as tk
 
-        self.app = app
+        self.app, self.cameras = app, cameras
         self.root = root = tk.Tk()
         root.title(title)
         root.configure(padx=14, pady=12)
@@ -1412,12 +1537,29 @@ class Dashboard:
                               justify="left", wraplength=780)
             detail.grid(row=row, column=2, sticky="w")
             self.link_rows[name] = (dot, detail)
+        # One panel per robot camera: the live view while frames arrive, else why not.
+        self.camera_panels = {}
+        if cameras is not None:
+            views = tk.Frame(root)
+            views.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+            for column, (name, _, _) in enumerate(cameras.cameras):
+                panel = tk.Frame(views)
+                panel.grid(row=0, column=column, sticky="nw", padx=(0, 12))
+                dot = tk.Label(panel, text="●", font=("TkDefaultFont", 15),
+                               fg=DOT_COLORS["wait"])
+                dot.grid(row=0, column=0)
+                tk.Label(panel, text=name, font=("TkDefaultFont", 11, "bold"),
+                         anchor="w").grid(row=0, column=1, sticky="w")
+                image = tk.Label(panel, text="", font=("TkDefaultFont", 10), justify="left",
+                                 wraplength=460, anchor="nw", bg="#202124", fg="white")
+                image.grid(row=1, column=0, columnspan=2, sticky="nw")
+                self.camera_panels[name] = [dot, image, None, 0]  # photo, sequence
         self.details = tk.Label(root, text="", font=("TkFixedFont", 11), justify="left",
                                 anchor="w")
-        self.details.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.details.grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
         self.log = tk.Label(root, text="", font=("TkFixedFont", 10), justify="left",
                             anchor="w", fg="#333333")
-        self.log.grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.log.grid(row=5, column=0, columnspan=5, sticky="w", pady=(8, 0))
         keys = {"r": "reset", "s": "start", "p": "pause", "space": "pause",
                 "escape": "estop", "u": "release"}
         root.bind("<KeyPress>", lambda event: (
@@ -1451,7 +1593,27 @@ class Dashboard:
                              f"arm {' '.join(f'{v:+.2f}' for v in q)}")
         self.details.configure(text="\n".join(lines))
         self.log.configure(text="\n".join(status["messages"]))
+        self._refresh_cameras()
         self.root.after(100, self._refresh)
+
+    def _refresh_cameras(self):
+        import tkinter as tk
+
+        if self.cameras is None:
+            return
+        for name, (ppm, sequence, text) in self.cameras.views().items():
+            panel = self.camera_panels[name]
+            dot, image = panel[0], panel[1]
+            if ppm is None:
+                dot.configure(fg=DOT_COLORS["fail"])
+                image.configure(image="", text=text, width=56, height=4)
+                panel[2:] = [None, 0]
+            elif sequence != panel[3]:
+                photo = tk.PhotoImage(data=ppm, format="PPM")
+                dot.configure(fg=DOT_COLORS["ok"])
+                image.configure(image=photo, text="", width=photo.width(),
+                                height=photo.height())
+                panel[2:] = [photo, sequence]  # keep a reference or Tk drops the image
 
     def run(self):
         self.root.mainloop()
@@ -1534,11 +1696,20 @@ def main(argv=None):
                              "command; 0 (default) only warns")
     parser.add_argument("--log-csv", default=time.strftime(
         "/tmp/vega-hardware-teleop-%Y%m%d-%H%M%S.csv"),
-        help="Commanded and measured arm joints at 20 Hz")
+        help="Arm timing, joint, and wrist orientation telemetry at 20 Hz")
+    parser.add_argument("--latency-report", default=time.strftime(
+        "/tmp/vega-hardware-latency-%Y%m%d-%H%M%S.json"),
+        help="Bounded tracker-to-command and command-to-measured latency report")
+    parser.add_argument("--proximal-speed", type=float,
+                        help="Joints 1-4 slew limit in rad/s (default: --max-arm-speed)")
+    parser.add_argument("--wrist-speed", type=float,
+                        help="Joints 5-7 slew limit in rad/s (default: --max-arm-speed)")
     parser.add_argument("--hand-kp", type=float, default=HAND_MIT_GAINS[0],
                         help="Wuji finger stiffness written to both hands on connect")
     parser.add_argument("--hand-kd", type=float, default=HAND_MIT_GAINS[1],
                         help="Wuji finger damping written to both hands on connect")
+    parser.add_argument("--no-cameras", action="store_true",
+                        help="Do not show the robot's ego and right wrist camera views")
     defaults = TeleopLimits()
     for name in ("max_arm_speed", "max_hand_speed", "reset_speed",
                  "reset_clearance", "guard_clearance"):
@@ -1547,7 +1718,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 0.0 <= args.reset_shoulder_back <= 0.6:
         parser.error("--reset-shoulder-back must be between 0 and 0.6 rad")
-    if not 0.0 < args.max_arm_speed <= 2.0 or not 0.0 < args.reset_speed <= 0.6:
+    proximal_speed = args.max_arm_speed if args.proximal_speed is None else args.proximal_speed
+    wrist_speed = args.max_arm_speed if args.wrist_speed is None else args.wrist_speed
+    if (not 0.0 < args.max_arm_speed <= 2.0 or
+            not 0.0 < proximal_speed <= 2.0 or not 0.0 < wrist_speed <= 2.0 or
+            not 0.0 < args.reset_speed <= 0.6):
         parser.error("arm speeds must be positive and at most 2.0 (teleop) / 0.6 (reset) rad/s")
     if not (0.0 < args.hand_kp <= 12.0 and 0.0 <= args.hand_kd <= 1.0):
         parser.error("--hand-kp must be in (0, 12] and --hand-kd in [0, 1]")
@@ -1556,7 +1731,8 @@ def main(argv=None):
             if not os.environ.get(name):
                 parser.error(f"{name} must be set for the robot (see the launcher)")
     limits = TeleopLimits(
-        max_arm_speed=args.max_arm_speed, max_hand_speed=args.max_hand_speed,
+        max_arm_speed=args.max_arm_speed, proximal_speed=proximal_speed,
+        wrist_speed=wrist_speed, max_hand_speed=args.max_hand_speed,
         reset_speed=args.reset_speed, reset_clearance=args.reset_clearance,
         guard_clearance=args.guard_clearance, tracking_fault=args.tracking_fault or None)
     if args.fake_robot:
@@ -1586,14 +1762,22 @@ def main(argv=None):
     app = TeleopApp(connect_robot=connect_robot, hands_io=hands_io,
                     connect_glove=connect_glove, arm_input=arm_input, retargeters=retargeters,
                     reset_q=reset_pose(args.reset_shoulder_back), limits=limits,
-                    log_csv=args.log_csv)
+                    log_csv=args.log_csv, latency_report=args.latency_report)
     print(f"Logging commanded and measured arm joints to {args.log_csv}", flush=True)
+    print(f"Writing wrist latency report to {args.latency_report}", flush=True)
+    cameras = None
+    if not args.no_cameras:
+        from .robot_cameras import RobotCameras
+
+        cameras = RobotCameras()
     app.start()
     try:
-        Dashboard(app).run()
+        Dashboard(app, cameras=cameras).run()
     except KeyboardInterrupt:
         pass
     finally:
+        if cameras is not None:
+            cameras.close()
         app.stop()
     return 0
 

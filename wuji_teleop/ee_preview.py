@@ -129,7 +129,7 @@ class PreviewTeleop(HardwareTeleop):
     def request_reset(self):
         return False
 
-    def io_step(self):
+    def io_step(self, *, send_hands=True):
         if not self.arms_io.health()[0]:
             self.request_pause()
         if self.state in ("running", "resetting"):
@@ -141,7 +141,7 @@ class PreviewTeleop(HardwareTeleop):
                 elif self.state == "resetting" and np.max(np.abs(
                         positions[side] - self.hand_command[side])) > 0.05:
                     self.request_pause()
-        super().io_step()
+        super().io_step(send_hands=send_hands)
 
     def _step_reset(self, now, measured):
         if self._check_tracking(measured):

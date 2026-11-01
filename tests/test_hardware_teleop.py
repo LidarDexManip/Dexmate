@@ -210,6 +210,38 @@ class HardwareTeleopTests(unittest.TestCase):
         self._run(teleop, 0.1)
         self.assertLessEqual(np.max(teleop.hand_command["left"]), 2.0 * 0.1 + 1e-9)
 
+    def test_proximal_and_wrist_speeds_are_limited_separately(self):
+        start = reset_pose()
+        goal = start["left"] + 1.0
+        teleop = self._teleop(
+            start, mapping=_FixedMapping(goal), proximal_speed=0.5, wrist_speed=1.5)
+        self._call(teleop.request_start)
+        self._run(teleop, 0.1)
+        change = teleop.command["left"] - start["left"]
+        np.testing.assert_allclose(change[:4], 0.05, atol=1e-9)
+        np.testing.assert_allclose(change[4:], 0.15, atol=1e-9)
+
+    def test_arm_io_does_not_wait_for_slow_hand_commands(self):
+        class SlowHands(FakeHands):
+            def command(self, side, angles):
+                time.sleep(0.03)
+                super().command(side, angles)
+
+        teleop = self._teleop(reset_pose())
+        slow = SlowHands()
+        for side in SIDES:
+            slow.connect(side)
+            slow.enable(side, np.zeros(20))
+        teleop.hands_io = slow
+        started = time.monotonic()
+        teleop.io_step(send_hands=False)
+        arm_elapsed = time.monotonic() - started
+        started = time.monotonic()
+        teleop.hand_io_step()
+        hand_elapsed = time.monotonic() - started
+        self.assertLess(arm_elapsed, 0.03)
+        self.assertGreaterEqual(hand_elapsed, 0.06)
+
     def test_reset_moves_along_a_clear_path_and_holds_at_the_reset_pose(self):
         teleop = self._teleop(L_SHAPE)
         self.assertTrue(self._call(teleop.request_reset))
@@ -324,7 +356,7 @@ class HardwareTeleopTests(unittest.TestCase):
         self.assertEqual(len(rows), 10)  # 20 Hz for 0.5 s
         fields = rows[0].split(",")
         self.assertEqual(fields[1], "paused")
-        self.assertEqual(len(fields), 2 + 28)
+        self.assertEqual(len(fields), 2 + 10 + 42)
 
     def test_start_is_ignored_while_resetting(self):
         teleop = self._teleop(L_SHAPE)
@@ -429,6 +461,9 @@ class TrackerInputTests(unittest.TestCase):
         self.assertGreater(left, 0.02)
         self.assertLess(left, 0.4)
         self.assertLess(right, 0.02)
+        self.assertEqual(mapping.last_source_revision, trackers.count)
+        self.assertEqual(mapping.last_tracker_timestamp_ns, trackers.count)
+        self.assertLessEqual(clock() - mapping.last_source_received_at, 0.025)
 
     def test_tracker_links_show_live_trackers_and_ignored_duplicates(self):
         trackers = self._trackers(time.monotonic)
