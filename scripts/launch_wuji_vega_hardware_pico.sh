@@ -10,10 +10,16 @@ workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "Usage: $0 [WIFI_IP] [hardware_teleop options, e.g. --fake-robot]"
   echo "Defaults: ARM_INPUT=tracker; ZENOH_CONFIG=${workspace}/dm_vgce08fed0a4-1u.dzcfg."
-  echo "Env overrides: ARM_INPUT (tracker | pico-hand), ROBOT_NAME, ZENOH_CONFIG,"
+  echo "Env overrides: ARM_INPUT (tracker | pico-hand | none), ROBOT_NAME, ZENOH_CONFIG,"
   echo "  LEFT_GLOVE_SN, RIGHT_GLOVE_SN, LEFT_HAND_SN, RIGHT_HAND_SN,"
   echo "  LEFT_TRACKER_SN, RIGHT_TRACKER_SN, IK_CONFIG, HUMAN_HEIGHT,"
-  echo "  PICO_SCALE, RESET_SHOULDER_BACK, HAND_KP, HAND_KD, WIFI_INTERFACE, DEXSTREAM_BIN."
+  echo "  PICO_SCALE, RESET_SHOULDER_BACK, HAND_KP, HAND_KD, HANDS (both | left | right),"
+  echo "  HAND_CURRENT_LIMIT, HAND_COMPLIANCE (1 = on), FINGERTIP_FORCE_LIMIT,"
+  echo "  ARM_FEEDFORWARD (1.5 cancels the arm servo lag; default off),"
+  echo "  TELEOP_GUARD (all | allow-hands | off; default all),"
+  echo "  WIFI_INTERFACE, DEXSTREAM_BIN."
+  echo "Fingers only, left hand: ARM_INPUT=none HANDS=left HAND_CURRENT_LIMIT=0.8 $0"
+  echo "  ... with fingertip force regulation: add HAND_COMPLIANCE=1"
   echo "Rehearse with the real inputs but no robot: $0 --fake-robot"
   exit 0
 fi
@@ -82,8 +88,10 @@ elif [[ "$ARM_INPUT" == "pico-hand" ]]; then
       exit 1
     fi
   fi
+elif [[ "$ARM_INPUT" == "none" ]]; then
+  echo "Fingers only: the Vega arms are not connected. Start (S) makes the fingers follow the gloves."
 else
-  echo "ARM_INPUT must be tracker or pico-hand, not ${ARM_INPUT}" >&2
+  echo "ARM_INPUT must be tracker, pico-hand or none, not ${ARM_INPUT}" >&2
   exit 2
 fi
 
@@ -100,6 +108,12 @@ python_cmd=("$workspace/.venv/bin/python" -m wuji_teleop.hardware_teleop --arm-i
 [[ -n "${RESET_SHOULDER_BACK:-}" ]] && python_cmd+=(--reset-shoulder-back "$RESET_SHOULDER_BACK")
 [[ -n "${HAND_KP:-}" ]] && python_cmd+=(--hand-kp "$HAND_KP")
 [[ -n "${HAND_KD:-}" ]] && python_cmd+=(--hand-kd "$HAND_KD")
+[[ -n "${HANDS:-}" ]] && python_cmd+=(--hands "$HANDS")
+[[ -n "${HAND_CURRENT_LIMIT:-}" ]] && python_cmd+=(--hand-current-limit "$HAND_CURRENT_LIMIT")
+[[ "${HAND_COMPLIANCE:-0}" == 1 ]] && python_cmd+=(--hand-compliance)
+[[ -n "${FINGERTIP_FORCE_LIMIT:-}" ]] && python_cmd+=(--fingertip-force-limit "$FINGERTIP_FORCE_LIMIT")
+[[ -n "${ARM_FEEDFORWARD:-}" ]] && python_cmd+=(--arm-velocity-feedforward "$ARM_FEEDFORWARD")
+[[ -n "${TELEOP_GUARD:-}" ]] && python_cmd+=(--teleop-guard "$TELEOP_GUARD")
 python_cmd+=("$@")
 log_cmd python "${python_cmd[@]}"
 "${python_cmd[@]}"

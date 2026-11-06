@@ -14,12 +14,15 @@ from wuji_teleop.collision_check import ArmClearanceChecker, ResetPlanner, join_
 from wuji_teleop.hardware_teleop import (
     ARM_RATE_HZ,
     DEVICE_LINKS,
+    DexcontrolArms,
     FakeArms,
     FakeHands,
     HAND_MIT_GAINS,
     HandLinkBlocked,
     HardwareTeleop,
+    HeldArms,
     HeldWristImu,
+    NoArmInput,
     PicoArmMapping,
     SyntheticPicoLinks,
     TRACKER_IK_CONFIG,
@@ -28,11 +31,13 @@ from wuji_teleop.hardware_teleop import (
     TrackerArmMapping,
     TrackerLinks,
     WujiHands,
+    _HeldMapping,
     _ImuSlot,
     main,
     reset_pose,
 )
-from wuji_teleop.sources import HandFrame, SourceSnapshot, SyntheticSource
+from wuji_teleop.retarget import copy_finger
+from wuji_teleop.sources import HandFrame, SourceSnapshot, SyntheticSource, synthetic_keypoints
 from wuji_teleop.vega_bimanual_sim import SIDES, load_bimanual_scene
 from wuji_teleop.vr_pose_source import WristPoseFrame, WristPoseSnapshot
 from wuji_teleop.xr_tracker_source import TrackerFrame, TrackerSnapshot
@@ -210,6 +215,220 @@ class HardwareTeleopTests(unittest.TestCase):
         self._run(teleop, 0.1)
         self.assertLessEqual(np.max(teleop.hand_command["left"]), 2.0 * 0.1 + 1e-9)
 
+    def test_without_arm_input_the_arms_hold_while_the_fingers_follow(self):
+        teleop = self._teleop(reset_pose(), mapping=_HeldMapping())
+        self.assertTrue(self._call(teleop.request_start))
+        self._run(teleop, 1.0)
+        self.assertEqual(teleop.state, "running")
+        for side in SIDES:
+            np.testing.assert_allclose(teleop.command[side], reset_pose()[side])
+        np.testing.assert_allclose(teleop.hand_command["left"], GLOVE_ANGLES, atol=1e-9)
+
+    def test_a_hand_regulator_bends_what_is_sent_and_its_log_records_both(self):
+        teleop = self._teleop(reset_pose())
+
+        class _Regulator:
+            resets = 0
+
+            def reset(self):
+                self.resets += 1
+
+            def step(self, now, nominal, q_obs, current):
+                return SimpleNamespace(compliant=nominal - 0.1, force=np.ones((5, 3)),
+                                       weight=np.ones(5))
+
+        regulator = _Regulator()
+        teleop.hand_regulators = {"left": regulator}
+        commands, compliance = [], []
+        teleop.hand_log = SimpleNamespace(command=lambda *row: commands.append(row),
+                                          compliance=lambda *row: compliance.append(row))
+        sent = []
+        self.hands_io.command = lambda side, angles: sent.append((side, np.array(angles)))
+        teleop.sync_hand("left", np.full(20, 0.3))
+        teleop.hand_io_step()
+        left = dict(sent)["left"]
+        np.testing.assert_allclose(left, np.full(20, 0.2))           # compliant was sent
+        np.testing.assert_allclose(dict(sent)["right"], teleop.hand_command["right"])
+        self.assertEqual(regulator.resets, 1)                         # reset after sync_hand
+        side, nominal, compliant, observed, force, weight = compliance[0]
+        self.assertEqual(side, "left")
+        np.testing.assert_allclose(nominal, np.full(20, 0.3))
+        np.testing.assert_allclose(commands[0][1], left)              # log holds what was sent
+        teleop.hand_io_step()
+        self.assertEqual(regulator.resets, 1)
+
+    def test_estop_holds_the_last_compliant_reference_without_regulating(self):
+        teleop = self._teleop(reset_pose())
+        offsets = iter([0.1, 0.2, 0.3])
+
+        class _Regulator:
+            steps = 0
+
+            def reset(self):
+                pass
+
+            def step(self, now, nominal, q_obs, current):
+                self.steps += 1
+                return SimpleNamespace(compliant=nominal - next(offsets),
+                                       force=np.ones((5, 3)), weight=np.ones(5))
+
+        regulator = _Regulator()
+        teleop.hand_regulators = {"left": regulator}
+        sent = []
+        self.hands_io.command = lambda side, angles: sent.append(np.array(angles))
+        teleop.sync_hand("left", np.full(20, 0.5))
+        teleop.hand_io_step()
+        teleop.request_estop()
+        teleop.hand_io_step()
+        teleop.hand_io_step()
+        self.assertEqual(regulator.steps, 1)
+        left = sent[0::2]  # SIDES order: left, right
+        for frozen in left[1:]:
+            np.testing.assert_allclose(frozen, np.full(20, 0.4))
+        teleop.state = "paused"  # released: regulation resumes from the frozen pose
+        teleop.hand_io_step()
+        self.assertEqual(regulator.steps, 2)
+        np.testing.assert_allclose(sent[-2], np.full(20, 0.3))
+
+    def test_finger_commands_are_logged_with_their_pre_slew_goal(self):
+        teleop = self._teleop(reset_pose(), max_hand_speed=2.0)
+        rows = []
+        teleop.hand_log = SimpleNamespace(command=lambda *row: rows.append(row),
+                                          glove=lambda *row: None)
+        self._call(teleop.request_start)
+        self._run(teleop, 0.1)
+        self.assertEqual(len(rows), 2 * 10)  # both hands, every 100 Hz IO step
+        side, target, goal = rows[-2]
+        self.assertEqual(side, "left")
+        np.testing.assert_allclose(target, teleop.hand_command["left"])
+        np.testing.assert_allclose(goal, GLOVE_ANGLES, atol=1e-9)
+        self.assertLess(np.max(target), np.max(goal))  # still slewing toward the goal
+
+    def test_each_new_glove_frame_is_logged_once_while_running(self):
+        teleop = self._teleop(reset_pose())
+        rows = []
+        teleop.hand_log = SimpleNamespace(command=lambda *row: None,
+                                          glove=lambda *row: rows.append(row))
+        frame = HandFrame(np.full((21, 3), 0.01), self.clock(), 7, 7)
+        teleop.glove_sources["right"] = SimpleNamespace(
+            read=lambda: SourceSnapshot(frame, 1, 1, None))
+        self._run(teleop, 0.1)
+        self.assertEqual(rows, [])  # paused: nothing is retargeted
+        self._call(teleop.request_start)
+        self._run(teleop, 0.1)
+        left = [row for row in rows if row[0] == "left"]
+        right = [row for row in rows if row[0] == "right"]
+        self.assertGreaterEqual(len(left), 3)  # a fresh frame at every teleop step
+        self.assertEqual(len({row[1] for row in left}), len(left))
+        self.assertEqual([row[1] for row in right], [7])  # a repeated frame only once
+        np.testing.assert_allclose(right[0][2], 0.01)
+
+    def test_low_confidence_glove_finger_copies_its_neighbour_and_says_so(self):
+        teleop = self._teleop(reset_pose())
+        seen = []
+        teleop.retargeters["right"] = SimpleNamespace(
+            step=lambda points: seen.append(np.array(points)) or GLOVE_ANGLES.copy(),
+            reset=lambda: None)
+        points = synthetic_keypoints(1.0, "right")
+
+        def read():
+            frame = HandFrame(points, self.clock(), int(self.clock() * 1e6), 1,
+                              0.1, (0.95, 0.95, 0.95, 0.1, 0.95))
+            return SourceSnapshot(frame, int(self.clock() * 1e6), 1, None)
+
+        teleop.glove_sources["right"] = SimpleNamespace(read=read)
+        with redirect_stdout(io.StringIO()):
+            self._call(teleop.request_start)
+            self._run(teleop, 0.1)
+        np.testing.assert_allclose(seen[-1], copy_finger(points, 3, 4))
+        self.assertEqual(teleop.status()["finger_note"],
+                         {"left": "", "right": "ring copies pinky (ring sensor 0.10)"})
+        logged = [m for m in teleop.messages if "ring follows the pinky" in m]
+        self.assertEqual(len(logged), 1)
+        self.assertIn("Right glove ring sensor confidence 0.10", logged[0])
+
+    def _record_arm_commands(self):
+        sent = []
+        real = self.arms_io.command
+
+        def command(q, velocity=None):
+            sent.append(velocity)
+            real(q)
+
+        self.arms_io.command = command
+        return sent
+
+    def test_arm_feedforward_is_off_by_default(self):
+        teleop = self._teleop(reset_pose())
+        sent = self._record_arm_commands()
+        self._call(teleop.request_start)
+        self._run(teleop, 0.5)
+        self.assertTrue(sent)
+        self.assertTrue(all(velocity is None for velocity in sent))
+
+    def test_arm_feedforward_sends_the_scaled_rate_of_the_command(self):
+        start = reset_pose()
+        goal = {side: start[side].copy() for side in SIDES}
+        goal["left"][0] += 1.0
+        teleop = self._teleop(start, mapping=_FixedMapping(goal["left"]),
+                              arm_velocity_feedforward=1.5, proximal_speed=0.5)
+        sent = self._record_arm_commands()
+        self._call(teleop.request_start)
+        self._run(teleop, 0.3)
+        self.assertLessEqual(np.abs(sent[0]["left"]).max(), 1e-9)  # no history yet
+        np.testing.assert_allclose(sent[-1]["left"][0], 1.5 * 0.5, atol=0.02)  # at the 0.5 rad/s slew
+        np.testing.assert_allclose(sent[-1]["left"][1:3], 0.0, atol=1e-9)
+
+    def test_arm_feedforward_is_smoothed_over_steps_in_the_command(self):
+        teleop = self._teleop(reset_pose(), arm_velocity_feedforward=1.0)
+        q = {side: np.zeros(7) for side in SIDES}
+        rates = []
+        for tick in range(30):  # a frame every 4 ticks: the raw rate is all or nothing
+            if tick % 4 == 0:
+                q = {side: q[side] + 0.01 for side in SIDES}
+            rates.append(teleop._arm_feedforward(tick * 0.01, "running", q)["left"][0])
+        settled = np.array(rates[12:])  # true rate 0.25 rad/s; a per-tick rate would hit 1.0
+        self.assertLessEqual(settled.max(), 0.3 + 1e-9)
+        self.assertGreaterEqual(settled.min(), 0.2 - 1e-9)
+
+    def test_arm_feedforward_stops_at_once_on_pause_and_estop_and_starts_clean(self):
+        start = reset_pose()
+        goal = start["left"].copy()
+        goal[0] += 1.0
+        teleop = self._teleop(start, mapping=_FixedMapping(goal), arm_velocity_feedforward=1.5)
+        sent = self._record_arm_commands()
+        self._call(teleop.request_start)
+        self._run(teleop, 0.2)
+        self.assertIsNotNone(sent[-1])
+        self._call(teleop.request_pause)
+        sent.clear()
+        self._run(teleop, 0.1)
+        self.assertTrue(all(velocity is None for velocity in sent))
+        self.assertEqual(len(teleop._command_history), 0)
+        self._call(teleop.request_start)
+        sent.clear()
+        self._run(teleop, 0.02)
+        self.assertLessEqual(np.abs(sent[0]["left"]).max(), 1e-9)  # the old motion is gone
+        self._call(teleop.request_estop)
+        sent.clear()
+        self._run(teleop, 0.1)
+        self.assertTrue(all(velocity is None for velocity in sent))
+
+    def test_dexcontrol_arms_send_velocity_only_when_given_one(self):
+        calls = []
+        arm = SimpleNamespace(
+            set_joint_pos=lambda q: calls.append(("pos", q)),
+            set_joint_pos_vel=lambda q, v: calls.append(("pos_vel", q, v)))
+        arms = object.__new__(DexcontrolArms)
+        arms._arms = {side: arm for side in SIDES}
+        q = {side: np.zeros(7) for side in SIDES}
+        arms.command(q)
+        self.assertEqual([call[0] for call in calls], ["pos", "pos"])
+        calls.clear()
+        arms.command(q, {side: np.full(7, 0.5) for side in SIDES})
+        self.assertEqual([call[0] for call in calls], ["pos_vel", "pos_vel"])
+        np.testing.assert_allclose(calls[0][2], 0.5)
+
     def test_proximal_and_wrist_speeds_are_limited_separately(self):
         start = reset_pose()
         goal = start["left"] + 1.0
@@ -323,6 +542,17 @@ class HardwareTeleopTests(unittest.TestCase):
         self._run(teleop, 1.0)
         np.testing.assert_allclose(teleop.command["left"], reset_pose(0.0)["left"])
         self.assertTrue(any("Guard: holding" in message for message in teleop.messages))
+
+    def test_guard_off_holds_nothing_and_still_reports_clearance(self):
+        into_arm = reset_pose(0.0)["left"].copy()
+        into_arm[2] = 0.8
+        teleop = self._teleop(reset_pose(0.0), mapping=_FixedMapping(into_arm), teleop_guard="off")
+        self._call(teleop.request_start)
+        self._run(teleop, 2.0)
+        np.testing.assert_allclose(teleop.command["left"], into_arm)
+        self.assertFalse(any("Guard: holding" in message for message in teleop.messages))
+        self.assertLess(teleop.status()["clearance"].distance_m, 0.0)
+        self.assertEqual(teleop.status()["guard"], "off")
 
     def test_lagging_arm_only_warns_by_default(self):
         teleop = self._teleop(L_SHAPE, lag=0.0)  # the fake arm never moves
@@ -505,16 +735,19 @@ class _BlockedHands(FakeHands):
 class TeleopAppTests(unittest.TestCase):
     """Connections are made and retried in the background; nothing exits."""
 
-    def _app(self, *, robot_failures=0, hands=None, glove_failures=()):
+    def _app(self, *, robot_failures=0, hands=None, glove_failures=(), arms=FakeArms,
+             arm_input=None, limits=None, **options):
         attempts = {"robot": 0}
+        self.glove_attempts = []
 
         def connect_robot():
             attempts["robot"] += 1
             if attempts["robot"] <= robot_failures:
                 raise RuntimeError("robot unreachable")
-            return FakeArms(reset_pose())
+            return arms(reset_pose())
 
         def connect_glove(side):
+            self.glove_attempts.append(side)
             if side in glove_failures:
                 raise RuntimeError("Connection timeout")
             return SyntheticSource(side), HeldWristImu()
@@ -522,11 +755,54 @@ class TeleopAppTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             app = TeleopApp(
                 connect_robot=connect_robot, hands_io=hands or FakeHands(),
-                connect_glove=connect_glove, arm_input=SyntheticPicoLinks(),
+                connect_glove=connect_glove, arm_input=arm_input or SyntheticPicoLinks(),
                 retargeters={side: _FixedRetargeter() for side in SIDES},
-                reset_q=reset_pose(), limits=TeleopLimits(), retry_s=5.0,
-                start_teleop=False)
+                reset_q=reset_pose(), limits=limits or TeleopLimits(), retry_s=5.0,
+                start_teleop=False, **options)
         return app
+
+    def test_allow_hands_guards_teleop_without_hand_to_hand_but_not_the_reset_path(self):
+        app = self._app(limits=TeleopLimits(teleop_guard="allow-hands"))
+        self._step(app, 0.0, "robot_step")
+        hands_touch = reset_pose(0.0)
+        hands_touch["left"][2], hands_touch["right"][2] = 0.25, -0.25
+        q = join_arms(hands_touch)
+        for checker in (app.teleop.guard_checker, app.planner.checker):
+            for side in SIDES:
+                checker.set_fingers(side, np.zeros(20))
+        self.assertGreater(app.teleop.guard_checker.clearance(q).distance_m, 0.015)
+        self.assertLess(app.planner.checker.clearance(q).distance_m, 0.0)
+        self.assertEqual(app.status()["guard"], "allow-hands")
+
+    def test_fingers_only_mode_never_connects_the_arms_and_shows_it(self):
+        app = self._app(arms=HeldArms, arm_input=NoArmInput())
+        self._step(app, 0.0, "robot_step")
+        self.assertEqual(app.links["Robot arms"].level, "off")
+        self.assertIn("--arm-input none", app.links["Robot arms"].detail)
+        self.assertIsNotNone(app.teleop)
+        self.assertNotIn("Tracker service", app.links)
+
+    def test_hand_compliance_builds_one_regulator_per_connected_hand(self):
+        from wuji_teleop.hand_compliance import ComplianceParams, HandForceRegulator
+
+        app = self._app(hand_sides=("left",), hand_compliance=ComplianceParams())
+        self._step(app, 0.0, "robot_step")
+        self.assertEqual(list(app.teleop.hand_regulators), ["left"])
+        self.assertIsInstance(app.teleop.hand_regulators["left"], HandForceRegulator)
+        plain = self._app()
+        self._step(plain, 0.0, "robot_step")
+        self.assertEqual(plain.teleop.hand_regulators, {})
+
+    def test_hands_option_leaves_the_other_hand_and_glove_alone(self):
+        hands = FakeHands()  # both reachable: only the option keeps the right one out
+        app = self._app(hands=hands, hand_sides=("left",))
+        self._step(app, 0.0, "robot_step", "hands_step", "gloves_step")
+        self.assertTrue(hands.is_connected("left"))
+        self.assertFalse(hands.is_connected("right"))
+        self.assertEqual(self.glove_attempts, ["left"])
+        for name in ("Right hand", "Right glove"):
+            self.assertEqual(app.links[name].level, "off")
+            self.assertIn("--hands left", app.links[name].detail)
 
     def _step(self, app, now, *steps):
         with redirect_stdout(io.StringIO()):
@@ -591,6 +867,35 @@ class TeleopAppTests(unittest.TestCase):
         self.assertIn("subnet", right.hint)
         self.assertFalse(app.hands_io.is_connected("right"))
 
+    def test_regulators_use_the_load_table_of_the_connected_hand(self):
+        from wuji_teleop.hand_compliance import ComplianceParams
+
+        hands = FakeHands()
+        app = self._app(hands=hands, hand_compliance=ComplianceParams())
+        self._step(app, 0.0, "robot_step", "hands_step")
+        regulator = app.teleop.hand_regulators["left"]
+        self.assertIsNone(regulator.load_source())
+        self.assertIn("no joint load table", app.links["Left hand"].detail)
+        hands.serials["left"] = "WH2JA01260722011"
+        self.assertEqual(regulator.load_source().friction.shape, (20,))
+        self._step(app, 0.0, "hands_step")
+        self.assertNotIn("no joint load table", app.links["Left hand"].detail)
+
+    def test_no_load_table_note_without_compliance(self):
+        app = self._app()
+        self._step(app, 0.0, "robot_step", "hands_step")
+        self.assertNotIn("no joint load table", app.links["Left hand"].detail)
+
+    def test_a_hand_running_without_a_faulted_joint_says_so(self):
+        hands = FakeHands()
+        hands.faults["right"] = {9: 0x2102}
+        app = self._app(hands=hands)
+        self._step(app, 0.0, "robot_step", "hands_step")
+        right = app.links["Right hand"]
+        self.assertEqual(right.level, "ok")
+        self.assertIn("without middle.S2 (fault 0x2102, left disabled)", right.detail)
+        self.assertNotIn("without", app.links["Left hand"].detail)
+
     def test_hand_connecting_later_joins_without_a_jump(self):
         hands = FakeHands(start={side: np.full(20, 0.5) for side in SIDES},
                           connected={"left"})
@@ -624,8 +929,26 @@ class TeleopAppTests(unittest.TestCase):
 class _FakeWujiHand:
     def __init__(self, handedness, serial_number="WH2JA0001"):
         self.gains, self.info = [], SimpleNamespace(firmware_version="2.13.1")
+        self.limits, self.limit_writes = [1.5] * 20, []
         self._handedness = handedness
         self.serial_number = serial_number
+        self.diagnostic_codes, self.enabled, self.sent = {}, [], []
+
+    def joint_diagnostics(self):
+        def subscribe(callback):  # nid = bus * 5 + node, joints on nodes 1-4
+            callback(SimpleNamespace(joints=[
+                SimpleNamespace(nid=j // 4 * 5 + j % 4 + 1,
+                                error_code_current=self.diagnostic_codes.get(j, 0))
+                for j in range(20)]))
+            return SimpleNamespace(close=lambda: None)
+
+        return SimpleNamespace(subscribe_with_callback=subscribe)
+
+    def joint_command(self):
+        return SimpleNamespace(publish=lambda: SimpleNamespace(send=self.sent.append))
+
+    def enable(self, joints=None):
+        self.enabled.append(joints)
 
     def handedness(self):
         return SimpleNamespace(get=lambda: self._handedness)
@@ -634,7 +957,18 @@ class _FakeWujiHand:
         return SimpleNamespace(set=self.gains.append)
 
     def joint_states(self):
-        return SimpleNamespace(subscribe_with_callback=lambda callback: object())
+        def subscribe(callback):
+            self.on_state = callback
+            return SimpleNamespace(close=lambda: None)
+
+        return SimpleNamespace(subscribe_with_callback=subscribe)
+
+    def effort_limit(self):
+        def write(value):
+            self.limit_writes.append(value)
+            self.limits = list(value) if isinstance(value, list) else [value] * 20
+
+        return SimpleNamespace(get=lambda: list(self.limits), set=write)
 
 
 class WujiHandsTests(unittest.TestCase):
@@ -653,6 +987,7 @@ class WujiHandsTests(unittest.TestCase):
             hands.addresses["left"] = "192.168.77.110:50001"
             hands.connect("left")
         self.assertTrue(hands.is_connected("left"))
+        self.hands = hands
         return hand
 
     def test_discovery_scans_in_a_child_process(self):
@@ -685,8 +1020,65 @@ class WujiHandsTests(unittest.TestCase):
     def test_connect_writes_requested_finger_gains(self):
         self.assertEqual(self.connect_left(mit_gains=(5, 0.2)).gains, [(5.0, 0.2)])
 
+    def test_current_limit_is_written_on_connect_and_restored_on_close(self):
+        hand = self.connect_left(current_limit=0.8)
+        self.assertEqual(hand.limit_writes, [0.8])
+        self.hands.close()
+        self.assertEqual(hand.limit_writes, [0.8, [1.5] * 20])
+
+    def test_hand_current_limit_is_left_alone_by_default(self):
+        hand = self.connect_left()
+        self.hands.close()
+        self.assertEqual(hand.limit_writes, [])
+
+    def test_every_joint_state_frame_is_logged(self):
+        rows = []
+        hand = self.connect_left(log=SimpleNamespace(state=lambda *row: rows.append(row)))
+        joints = [SimpleNamespace(position=0.01 * j, velocity=0.5, effort=-0.02)
+                  for j in range(20)]
+        hand.on_state(SimpleNamespace(num_joints=20, joints=joints,
+                                      header=SimpleNamespace(timestamp_us=777)))
+        ((side, stamp, q, v, effort),) = rows
+        self.assertEqual((side, stamp), ("left", 777))
+        np.testing.assert_allclose(q, 0.01 * np.arange(20))
+        self.assertEqual((v[0], effort[19]), (0.5, -0.02))
+
+    def test_a_faulted_joint_is_left_disabled_and_holds_its_measured_angle(self):
+        hand = self.connect_left()
+        hand.diagnostic_codes = {9: 0x2102}  # right middle.S2 on the robot
+        joints = [SimpleNamespace(position=0.2, velocity=0.0, effort=0.0) for _ in range(20)]
+        hand.on_state(SimpleNamespace(num_joints=20, joints=joints,
+                                      header=SimpleNamespace(timestamp_us=1)))
+        self.hands.enable("left", np.full(20, 0.2))
+        (mask,) = hand.enabled
+        self.assertEqual([j for j in range(20) if not mask[j]], [9])
+        self.assertEqual(self.hands.faults["left"], {9: 0x2102})
+        self.hands.command("left", np.full(20, 0.6))
+        sent = np.array([command.position for command in hand.sent[-1]])
+        self.assertAlmostEqual(sent[9], 0.2)
+        np.testing.assert_allclose(np.delete(sent, 9), 0.6)
+
+    def test_a_listed_joint_stays_disabled_when_its_fault_reads_clear(self):
+        hand = self.connect_left()
+        with patch.dict("wuji_teleop.hardware_teleop.DISABLED_JOINTS",
+                        {"WH2JA0001": {9: 0x2102}}):
+            self.hands.enable("left", np.zeros(20))
+        (mask,) = hand.enabled
+        self.assertEqual([j for j in range(20) if not mask[j]], [9])
+        self.assertEqual(self.hands.faults["left"], {9: 0x2102})
+
+    def test_a_healthy_hand_is_enabled_whole(self):
+        hand = self.connect_left()
+        self.hands.enable("left", np.zeros(20))
+        self.assertEqual(hand.enabled, [None])
+        self.assertEqual(self.hands.faults["left"], {})
+
     def test_out_of_range_finger_gains_are_rejected(self):
-        for flags in (["--hand-kp", "0"], ["--hand-kp", "20"], ["--hand-kd", "-0.1"]):
+        for flags in (["--hand-kp", "0"], ["--hand-kp", "20"], ["--hand-kd", "-0.1"],
+                      ["--hand-current-limit", "0"], ["--hand-current-limit", "2"],
+                      ["--fingertip-force-limit", "0.5"], ["--fingertip-force-limit", "40"],
+                      ["--arm-velocity-feedforward", "-0.5"],
+                      ["--arm-velocity-feedforward", "3"], ["--teleop-guard", "maybe"]):
             with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main(["--fake-robot", "--synthetic-input", *flags])
 

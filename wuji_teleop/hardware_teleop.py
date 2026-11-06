@@ -16,9 +16,9 @@ Arms track relatively, calibrated at the robot's pose on Start, as in
 (XRoboToolkit) drives all seven joints through GMR-style IK; ``--arm-input
 pico-hand`` uses Pico hand tracking for joints 1-4 and the glove palm IMUs for
 the wrists. Hands track absolutely: each glove skeleton is retargeted to the
-matching Wuji Hand 2's 20 joints. Every teleop target is also checked for
-clearance and held if it would bring a hand or arm closer than the guard
-distance.
+matching Wuji Hand 2's 20 joints. By default every teleop target is also checked
+for clearance and held if it would bring a hand or arm closer than the guard
+distance (``--teleop-guard``).
 """
 
 from __future__ import annotations
@@ -42,8 +42,9 @@ import numpy as np
 
 from .collision_check import (
     ArmClearanceChecker, PathFollower, PlanningError, ResetPlanner, join_arms, split_arms)
+from .hand_load import JointLoad
 from .latency import AsyncCsvLogger, LatencyRecorder
-from .retarget import TrackingController
+from .retarget import FingerStandIn, TrackingController
 from .sources import SourceSnapshot, SyntheticSource
 from .vega_arm_sim import (
     HAND_IN_EE_ROTATION, PicoHandArmMapper, RIGHT_ARM_JOINT_SIGNS, WristOrientationIK,
@@ -60,6 +61,9 @@ TRACKER_IK_CONFIG = (Path(__file__).with_name("ik_configs")
                      / "xr_trackers_to_vega_1u_decoupled.json")
 ARM_RATE_HZ = 100.0
 TELEOP_RATE_HZ = 40.0
+# Tracker frames step at about 28/s with gaps: the arm command's rate over this window
+# is the velocity fed forward. A shorter one gains little and is much rougher.
+ARM_FEEDFORWARD_WINDOW = 10  # 100 Hz ticks
 # Wuji MIT impedance (kp, kd) written to every hand on connect, so a firmware
 # upgrade or a swapped hand cannot silently change the stiffness. kp 12 / kd 0.3
 # (an old left-hand setting) made the finger motors buzz while holding.
@@ -100,9 +104,13 @@ class DexcontrolArms:
         return {side: np.asarray(arm.get_joint_pos(), dtype=np.float64)
                 for side, arm in self._arms.items()}
 
-    def command(self, q):
+    def command(self, q, velocity=None):
         for side, arm in self._arms.items():
-            arm.set_joint_pos(np.asarray(q[side], dtype=np.float64))
+            if velocity is None:
+                arm.set_joint_pos(np.asarray(q[side], dtype=np.float64))
+            else:
+                arm.set_joint_pos_vel(np.asarray(q[side], dtype=np.float64),
+                                      np.asarray(velocity[side], dtype=np.float64))
 
     def estop(self):
         """(hardware button pressed, software E-stop enabled)."""
@@ -124,6 +132,11 @@ class DexcontrolArms:
         self._robot.shutdown()
 
 
+# Finger joints never enabled, by hand serial: {joint index: last error code}. A latched
+# fault can read clear after a restart while its cause remains.
+DISABLED_JOINTS = {"WH2KA01260827009": {9: 0x2102}}  # right middle.S2, tripped while idle
+
+
 class HandLinkBlocked(RuntimeError):
     """Connecting to this hand now would lock it (ambiguous laptop address)."""
 
@@ -135,21 +148,31 @@ class WujiHands:
     ``connection_monitor.ambiguous_hand_source``): the failed attempt that
     would follow locks the hand until a 12 V power cycle. It also writes
     ``mit_gains`` to the hand before anything can enable it (not saved to flash).
+    Every 1 kHz joint state frame goes to ``log`` (a ``HandLogger``) when given.
+    ``current_limit`` (A per joint) replaces the hand's own limit while
+    connected; ``close`` puts the original back. A joint in ``DISABLED_JOINTS`` or
+    reporting a latched fault when its hand is enabled stays disabled and is sent
+    its own measured angle; the other joints run (``faults`` lists them per side).
     """
 
-    def __init__(self, serials=None, mit_gains=HAND_MIT_GAINS):
+    def __init__(self, serials=None, mit_gains=HAND_MIT_GAINS, log=None, current_limit=None):
         import wuji_sdk
 
         wuji_sdk.set_log_level("warn")
         self._sdk = wuji_sdk
         self._manager = wuji_sdk.SdkManager.instance()
         self.mit_gains = tuple(float(g) for g in mit_gains)
+        self.log = log
+        self.current_limit = None if current_limit is None else float(current_limit)
+        self._limits_before = {}
         self.serials = {side: (serials or {}).get(side) for side in SIDES}
         self.addresses = {side: None for side in SIDES}
         self.firmware = {side: None for side in SIDES}
         self._lock = threading.Lock()
         self._latest = {side: None for side in SIDES}
+        self._effort = {side: None for side in SIDES}
         self._received_at = {side: None for side in SIDES}
+        self.faults = {side: {} for side in SIDES}  # joint index -> error code, left disabled
         self._hands, self._subscriptions, self._publishers = {}, {}, {}
 
     def discover(self):
@@ -198,6 +221,11 @@ class WujiHands:
             if side not in reported:
                 raise RuntimeError(f"{self.serials[side]} reports {reported}, expected {side}")
             hand.mit_params().set(self.mit_gains)
+            if self.current_limit is not None:
+                self._limits_before[side] = [
+                    self.current_limit if limit is None else float(limit)
+                    for limit in hand.effort_limit().get()]
+                hand.effort_limit().set(self.current_limit)
             subscription = hand.joint_states().subscribe_with_callback(
                 functools.partial(self._on_state, side))
         except BaseException:
@@ -210,9 +238,16 @@ class WujiHands:
 
     def _on_state(self, side, frame):
         if frame.num_joints == 20:
+            joints = frame.joints
+            q = np.array([j.position for j in joints])
+            effort = np.array([j.effort for j in joints])
             with self._lock:
-                self._latest[side] = np.array([j.position for j in frame.joints])
+                self._latest[side] = q
+                self._effort[side] = effort
                 self._received_at[side] = time.monotonic()
+            if self.log is not None:
+                self.log.state(side, frame.header.timestamp_us, q,
+                               [j.velocity for j in joints], effort)
 
     def is_connected(self, side):
         return side in self._hands
@@ -229,6 +264,12 @@ class WujiHands:
         with self._lock:
             return {side: None if q is None else q.copy() for side, q in self._latest.items()}
 
+    def feedback(self, side):
+        """Latest (joint angles, motor currents in A) from one frame, or None."""
+        with self._lock:
+            q, effort = self._latest[side], self._effort[side]
+            return None if q is None or effort is None else (q.copy(), effort.copy())
+
     def wait_position(self, side, timeout=3.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -238,12 +279,43 @@ class WujiHands:
             time.sleep(0.02)
         raise RuntimeError("connected but no joint feedback")
 
+    def watch_diagnostics(self, side, callback):
+        """Subscribe to one hand's 1 kHz joint diagnostics; close the result to stop."""
+        return self._hands[side].joint_diagnostics().subscribe_with_callback(callback)
+
+    def joint_index(self, nid):
+        return self._sdk.WujiHand2.nid_to_joint_index(nid)
+
+    def _read_faults(self, side, timeout=0.5):
+        """Joints whose diagnostics carry an error code (one 1 kHz frame suffices)."""
+        frames = []
+        subscription = self.watch_diagnostics(side, frames.append)
+        try:
+            deadline = time.monotonic() + timeout
+            while not frames and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            subscription.close()
+        if not frames:
+            raise RuntimeError("no joint diagnostics")
+        return {self.joint_index(e.nid): int(e.error_code_current)
+                for e in frames[0].joints if e.error_code_current}
+
     def enable(self, side, hold):
-        """Enable one hand holding ``hold`` so enabling cannot move a finger."""
+        """Enable one hand holding ``hold`` so enabling cannot move a finger.
+
+        Joints in ``DISABLED_JOINTS`` or with a latched fault are left out of the
+        enable mask.
+        """
+        faults = {**DISABLED_JOINTS.get(self.serials[side], {}), **self._read_faults(side)}
         publisher = self._hands[side].joint_command().publish()
         for _ in range(5):
             self._send(publisher, hold)
-        self._hands[side].enable()
+        if faults:
+            self._hands[side].enable([0 if j in faults else 1 for j in range(20)])
+        else:
+            self._hands[side].enable()
+        self.faults[side] = faults
         self._publishers[side] = publisher
 
     def _send(self, publisher, angles):
@@ -252,8 +324,17 @@ class WujiHands:
 
     def command(self, side, angles):
         publisher = self._publishers.get(side)
-        if publisher is not None:
-            self._send(publisher, angles)
+        if publisher is None:
+            return
+        faults = self.faults[side]
+        if faults:
+            with self._lock:
+                measured = self._latest[side]
+            if measured is not None:
+                angles = np.array(angles, dtype=np.float64)
+                for j in faults:
+                    angles[j] = measured[j]
+        self._send(publisher, angles)
 
     def close(self):
         for side, hand in list(self._hands.items()):
@@ -266,6 +347,12 @@ class WujiHands:
                 publisher.close()
             if side in self._subscriptions:
                 self._subscriptions.pop(side).close()
+            if side in self._limits_before:
+                try:
+                    hand.effort_limit().set(self._limits_before.pop(side))
+                except Exception as exc:
+                    print(f"{side} hand: could not restore its current limit: {exc}",
+                          flush=True)
             self._manager.disconnect(f"vega_{side}_wuji_hand")
         self._hands.clear()
 
@@ -281,7 +368,7 @@ class FakeArms:
     def positions(self):
         return _copy(self._q)
 
-    def command(self, q):
+    def command(self, q, velocity=None):
         self._q = {side: self._q[side] + self.lag * (np.asarray(q[side]) - self._q[side])
                    for side in SIDES}
 
@@ -298,6 +385,16 @@ class FakeArms:
         pass
 
 
+class HeldArms(FakeArms):
+    """``--arm-input none``: the Vega arms are never connected or commanded.
+
+    A still stand-in at the reset pose (hands forward, clear of the body) gives
+    the finger clearance checks an arm pose.
+    """
+
+    stand_in = "not connected (--arm-input none): the arms are left alone"
+
+
 class FakeHands:
     """Stand-in for ``WujiHands`` whose fingers reach each command at once."""
 
@@ -308,6 +405,7 @@ class FakeHands:
         self._connected, self._ready = set(), set()
         self.serials = {side: f"fake-{side}" for side in SIDES}
         self.firmware = {side: "fake" for side in SIDES}
+        self.faults = {side: {} for side in SIDES}
         self.addresses = {side: "fake" for side in SIDES}
 
     def discover(self):
@@ -330,6 +428,11 @@ class FakeHands:
     def positions(self):
         return {side: self._q[side].copy() if side in self._connected else None
                 for side in SIDES}
+
+    def feedback(self, side):
+        if side not in self._connected:
+            return None
+        return self._q[side].copy(), np.zeros(20)
 
     def wait_position(self, side, timeout=3.0):
         return self._q[side].copy()
@@ -552,18 +655,27 @@ class _HandGoal:
         self.target = np.array(angles, dtype=np.float64)
 
 
+GUARD_NOTES = {"all": "", "allow-hands": "  (guard: hands may touch each other)",
+               "off": "  (GUARD OFF: nothing is held)"}
+
+
 @dataclass
 class TeleopLimits:
-    max_arm_speed: float = 1.0       # rad/s per joint while following
-    proximal_speed: float | None = None  # joints 1-4; None preserves max_arm_speed
-    wrist_speed: float | None = None     # joints 5-7; None preserves max_arm_speed
+    max_arm_speed: float = 1.5       # rad/s per joint while following
+    proximal_speed: float = 1.0  # joints 1-4; None preserves max_arm_speed
+    wrist_speed: float = 1.5    # joints 5-7; None preserves max_arm_speed
     max_hand_speed: float = 5.0      # rad/s per finger joint
     reset_speed: float = 0.30        # rad/s peak per joint during reset
     reset_acceleration: float = 0.60
     reset_clearance: float = 0.03    # m, kept along the whole reset path
     guard_clearance: float = 0.015   # m, teleop targets closer than this are held
+    # "all", "allow-hands" (not left hand against right hand) or "off" (nothing is held)
+    teleop_guard: str = "all"
     tracking_lag_warning: float = 0.30  # rad between command and measured: warn once
     tracking_fault: float | None = None  # rad; set to stop and hold instead (off by default)
+    # Times the command's rate sent as velocity while following. The arm's servo lags a
+    # position alone by about 0.41 s; 1.5 cancels that on the robot (test of 2026-11-04).
+    arm_velocity_feedforward: float = 0.0
 
     def arm_speed_step(self):
         proximal = self.max_arm_speed if self.proximal_speed is None else self.proximal_speed
@@ -582,8 +694,16 @@ class HardwareTeleop:
                  guard_checker, planner, reset_q, *, arm_lower, arm_upper,
                  hand_lower, hand_upper, limits=None, clock=time.monotonic,
                  threaded_planning=True, log_csv=None, latency_report=None,
-                 latency_recorder=None, perf_clock=time.monotonic):
+                 latency_recorder=None, perf_clock=time.monotonic, hand_log=None,
+                 hand_regulators=None):
         self.arms_io, self.hands_io = arms_io, hands_io
+        self.hand_log = hand_log
+        # side -> HandForceRegulator: turns the nominal finger reference into
+        # a force-limited compliant one (HACo-style), run where hands are sent.
+        self.hand_regulators = dict(hand_regulators or {})
+        self._regulator_resets = set()
+        self._glove_logged = {side: None for side in SIDES}  # last logged glove timestamp
+        self._compliant = {}  # last compliant reference sent per side
         self.mapping = mapping
         self.glove_sources, self.retargeters = glove_sources, retargeters
         self.guard_checker, self.planner = guard_checker, planner
@@ -605,8 +725,10 @@ class HardwareTeleop:
                 "wrist_speed_rad_s": float(
                     self.limits.max_arm_speed if self.limits.wrist_speed is None
                     else self.limits.wrist_speed),
+                "arm_velocity_feedforward": float(self.limits.arm_velocity_feedforward),
             })
         self._lag_warned = False
+        self._command_history = collections.deque(maxlen=ARM_FEEDFORWARD_WINDOW + 1)
         self._csv = None
         self._csv_ticks = 0
         if log_csv:
@@ -638,8 +760,7 @@ class HardwareTeleop:
                                            self.hand_lower[side], self.hand_upper[side])
                              for side in SIDES}
         self.hand_goal = _copy(self.hand_command)
-        self.fingers = {side: TrackingController(retargeters[side], _HandGoal())
-                        for side in SIDES}
+        self.fingers = self._finger_controllers()
         self.clearance = None
         self.estop_flags = tuple(arms_io.estop())
         self._pending = collections.deque()
@@ -665,6 +786,13 @@ class HardwareTeleop:
         self.goal = _copy(self.command)
         self.hand_goal = _copy(self.hand_command)
 
+    def _finger_controllers(self):
+        # Fresh controllers reset the retargeters on their first glove frame. A
+        # glove finger whose sensor reads low confidence copies a neighbour.
+        return {side: TrackingController(self.retargeters[side], _HandGoal(),
+                                         stand_in=FingerStandIn())
+                for side in SIDES}
+
     # Operator commands (any thread) -------------------------------------
     def request_start(self):
         with self._lock:
@@ -675,9 +803,7 @@ class HardwareTeleop:
                 self._log("Start refused: the robot E-stop is active.")
                 return False
             self.mapping.recenter(self.command)
-            # Fresh controllers reset the retargeters on their first glove frame.
-            self.fingers = {side: TrackingController(self.retargeters[side], _HandGoal())
-                            for side in SIDES}
+            self.fingers = self._finger_controllers()
             self._guard_holding = False
             self._freeze()
             self.state = "running"
@@ -745,6 +871,7 @@ class HardwareTeleop:
                         self.hand_lower[side], self.hand_upper[side])
             self.hand_command[side] = q
             self.hand_goal[side] = q.copy()
+            self._regulator_resets.add(side)  # applied by the hand-sending thread
 
     # Reset planning ------------------------------------------------------
     def _plan_reset(self, token, start, fingers):
@@ -827,15 +954,20 @@ class HardwareTeleop:
                 self._check_tracking(measured)
             arm_command = _copy(self.command)
             hand_command = _copy(self.hand_command)
+            hand_goal = _copy(self.hand_goal)
             goal = _copy(self.goal)
             mapping_telemetry = dict(self._mapping_telemetry)
             state = self.state
+        velocity = self._arm_feedforward(now, state, arm_command)
         arm_write_started = self.perf_clock()
-        self.arms_io.command(arm_command)
+        if velocity is None:
+            self.arms_io.command(arm_command)
+        else:
+            self.arms_io.command(arm_command, velocity)
         command_sent_at = self.perf_clock()
         arm_write_s = command_sent_at - arm_write_started
         if send_hands:
-            self._send_hands(hand_command)
+            self._send_hands(hand_command, hand_goal)
         io_finished = self.perf_clock()
         self._write_log(
             now, state, goal, arm_command, measured, mapping_telemetry,
@@ -850,18 +982,69 @@ class HardwareTeleop:
                 arm_read_s=arm_read_s, arm_write_s=arm_write_s,
                 io_duration_s=io_finished - io_started)
 
-    def _send_hands(self, hand_command):
+    def _arm_feedforward(self, now, state, command):
+        """Velocity to send with ``command``, or None for position alone.
+
+        Only while following: a hold, reset, pause or E-stop sends position alone, and
+        following starts again from a clean history, so no stale motion is fed forward.
+        """
+        scale = self.limits.arm_velocity_feedforward
+        if scale <= 0.0 or state != "running":
+            self._command_history.clear()
+            return None
+        self._command_history.append((now, command))
+        then, past = self._command_history[0]
+        if now <= then:
+            return {side: np.zeros_like(command[side]) for side in SIDES}
+        return {side: scale * (command[side] - past[side]) / (now - then) for side in SIDES}
+
+    def _regulate(self, side, nominal):
+        """The compliant reference for one hand, or the nominal without a regulator.
+
+        Under E-stop the regulator stops and the hand holds its last compliant
+        reference, so the fingers are frozen as the dashboard says.
+        """
+        regulator = self.hand_regulators.get(side)
+        if regulator is None or not self.hands_io.is_ready(side):
+            return nominal
+        with self._lock:
+            reset = side in self._regulator_resets
+            self._regulator_resets.discard(side)
+            frozen = self.state == "estop"
+        if reset:
+            regulator.reset()
+            self._compliant.pop(side, None)
+        if frozen:
+            return self._compliant.get(side, nominal)
+        feedback = self.hands_io.feedback(side)
+        if feedback is None:
+            return nominal
+        step = regulator.step(self.clock(), nominal, *feedback)
+        if self.hand_log is not None:
+            self.hand_log.compliance(side, nominal, step.compliant, feedback[0],
+                                     step.force, step.weight)
+        self._compliant[side] = step.compliant
+        return step.compliant
+
+    def _send_hands(self, hand_command, hand_goal=None):
         started = self.perf_clock()
+        sent = {side: self._regulate(side, hand_command[side]) for side in SIDES}
         for side in SIDES:
-            self.hands_io.command(side, hand_command[side])
+            self.hands_io.command(side, sent[side])
         if self.latency is not None:
             self.latency.record_hand_write(self.perf_clock() - started)
+        if self.hand_log is not None:
+            for side in SIDES:
+                if self.hands_io.is_ready(side):  # only commands that reach a hand
+                    self.hand_log.command(side, sent[side],
+                                          None if hand_goal is None else hand_goal[side])
 
     def hand_io_step(self):
         """Stream hands separately so a slow hand call cannot delay arm writes."""
         with self._lock:
             command = _copy(self.hand_command)
-        self._send_hands(command)
+            goal = _copy(self.hand_goal)
+        self._send_hands(command, goal)
 
     def _arm_io_step(self):
         self.io_step(send_hands=False)
@@ -943,7 +1126,15 @@ class HardwareTeleop:
             return
         hand_goal = {}
         for side in SIDES:
-            fingers[side].update(self.glove_sources[side].read(), now)
+            snapshot = self.glove_sources[side].read()
+            frame = snapshot.frame
+            if (self.hand_log is not None and frame is not None
+                    and frame.timestamp_us != self._glove_logged[side]):
+                self._glove_logged[side] = frame.timestamp_us
+                self.hand_log.glove(side, frame.timestamp_us, frame.keypoints)
+            fingers[side].update(snapshot, now)
+            for text in fingers[side].stand_in.take_changes():
+                self._log(f"{side.capitalize()} glove {text}")
             target = fingers[side].hand.target
             hand_goal[side] = (hand_command[side] if target is None else
                                np.clip(target, self.hand_lower[side], self.hand_upper[side]))
@@ -955,7 +1146,7 @@ class HardwareTeleop:
             self.guard_checker.set_fingers(side, hand_goal[side])
         clearance = self.guard_checker.clearance(join_arms(goal))
         held = False
-        if clearance.distance_m < self.limits.guard_clearance:
+        if self.limits.teleop_guard != "off" and clearance.distance_m < self.limits.guard_clearance:
             current = self.guard_checker.clearance(join_arms(command))
             if clearance.distance_m < current.distance_m:
                 goal, hand_goal, held = command, hand_command, True
@@ -1053,7 +1244,9 @@ class HardwareTeleop:
                 "hand_command": _copy(self.hand_command),
                 "arm_status": dict(self.mapping.status),
                 "finger_status": {side: self.fingers[side].status for side in SIDES},
+                "finger_note": {side: self.fingers[side].stand_in.note for side in SIDES},
                 "clearance": self.clearance,
+                "guard": self.limits.teleop_guard,
                 "estop": self.estop_flags,
                 "reset_remaining": (None if self._follower is None else max(
                     0.0, self._follower.duration - (self.clock() - self._follow_start))),
@@ -1151,6 +1344,34 @@ class SyntheticPicoLinks:
 
     def statuses(self):
         return {name: LinkStatus("ok", "synthetic input") for name in self.link_names}
+
+    def close(self):
+        pass
+
+
+class _HeldMapping:
+    """Arm mapping that never proposes a goal, so the arm commands hold."""
+
+    def __init__(self):
+        self.status = {side: "held (--arm-input none)" for side in SIDES}
+
+    def recenter(self, q):
+        pass
+
+    def update(self, q, now):
+        return {}
+
+
+class NoArmInput:
+    """``--arm-input none``: no arm tracking; only the gloves drive the fingers."""
+
+    link_names = ()
+
+    def make_mapping(self, model, data, arms, imu_slots, posture):
+        return _HeldMapping()
+
+    def statuses(self):
+        return {}
 
     def close(self):
         pass
@@ -1257,8 +1478,11 @@ class TeleopApp:
 
     def __init__(self, *, connect_robot, hands_io, connect_glove, arm_input, retargeters,
                  reset_q, limits, retry_s=5.0, start_teleop=True, log_csv=None,
-                 latency_report=None):
+                 latency_report=None, hand_log=None, hand_sides=SIDES, hand_compliance=None):
         self.connect_robot, self.hands_io = connect_robot, hands_io
+        self.hand_log = hand_log
+        self.hand_sides = tuple(hand_sides)  # robot hands (and their gloves) to connect
+        self.hand_compliance = hand_compliance  # ComplianceParams, or None for off
         self.connect_glove, self.arm_input = connect_glove, arm_input
         self.retargeters, self.reset_q, self.limits = retargeters, reset_q, limits
         self.retry_s = float(retry_s)
@@ -1274,6 +1498,11 @@ class TeleopApp:
         self._lock = threading.Lock()
         self.link_names = DEVICE_LINKS + tuple(arm_input.link_names)
         self.links = {name: LinkStatus("wait", "connecting...") for name in self.link_names}
+        for side in SIDES:
+            if side not in self.hand_sides:
+                for device in ("hand", "glove"):
+                    self.links[f"{side.capitalize()} {device}"] = LinkStatus(
+                        "off", f"not used (--hands {'/'.join(self.hand_sides)})")
         self.messages = collections.deque(maxlen=8)
         self.arms_io = None
         self.teleop = None
@@ -1315,6 +1544,10 @@ class TeleopApp:
                           "check robot power and the Ethernet link to 192.168.50.x; retrying")
                 return
             self._build_teleop()
+        stand_in = getattr(self.arms_io, "stand_in", None)
+        if stand_in:
+            self._set(name, "off", stand_in)
+            return
         alive, since = self.arms_io.health()
         button, software = self.arms_io.estop()
         if not alive:
@@ -1330,25 +1563,40 @@ class TeleopApp:
     def _build_teleop(self):
         mapping = self.arm_input.make_mapping(self.model, self.data, self.arms,
                                               self.imu_slots, self.reset_q)
+        regulators = None
+        if self.hand_compliance is not None:
+            from .hand_compliance import FingertipJacobians, HandForceRegulator
+
+            regulators = {side: HandForceRegulator(
+                FingertipJacobians(self.model, self.hand_models[side], side),
+                self.hand_models[side].lower, self.hand_models[side].upper,
+                self.hand_compliance,
+                load_source=functools.partial(self._hand_load, side))
+                for side in self.hand_sides}
         teleop = HardwareTeleop(
             self.arms_io, self.hands_io, mapping, self.glove_slots, self.retargeters,
-            ArmClearanceChecker(self.model, self.arms, self.hand_models), self.planner,
-            self.reset_q,
+            ArmClearanceChecker(self.model, self.arms, self.hand_models,
+                                hand_to_hand=self.limits.teleop_guard != "allow-hands"),
+            self.planner, self.reset_q,
             arm_lower={side: self.arms[side].lower for side in SIDES},
             arm_upper={side: self.arms[side].upper for side in SIDES},
             hand_lower={side: self.hand_models[side].lower for side in SIDES},
             hand_upper={side: self.hand_models[side].upper for side in SIDES},
             limits=self.limits, log_csv=self.log_csv,
-            latency_report=self.latency_report)
+            latency_report=self.latency_report, hand_log=self.hand_log,
+            hand_regulators=regulators)
         if self.start_teleop:
             teleop.start()
         self.teleop = teleop
+
+    def _hand_load(self, side):
+        return JointLoad.for_serial(self.hands_io.serials[side])
 
     def hands_step(self, now):
         from .connection_monitor import HAND_SUBNET_HINT
 
         hands = self.hands_io
-        for side in SIDES:
+        for side in self.hand_sides:
             name = f"{side.capitalize()} hand"
             if not hands.is_connected(side):
                 if not self._due(name, now):
@@ -1381,6 +1629,13 @@ class TeleopApp:
                     continue
             age = hands.feedback_age(side)
             label = f"{hands.serials[side]} (fw {hands.firmware[side]})"
+            faults = hands.faults[side]
+            if faults:
+                label += " without " + ", ".join(
+                    f"{('thumb', 'index', 'middle', 'ring', 'pinky')[j // 4]}.S{j % 4 + 1} "
+                    f"(fault {code:#06x}, left disabled)" for j, code in sorted(faults.items()))
+            if self.hand_compliance is not None and self._hand_load(side) is None:
+                label += " with no joint load table (python -m wuji_teleop.hand_load)"
             if age is not None and age < 0.5:
                 self._set(name, "ok", f"{label} enabled, feedback live")
             else:
@@ -1389,7 +1644,7 @@ class TeleopApp:
                           "check the hand's power and cable")
 
     def gloves_step(self, now):
-        for side in SIDES:
+        for side in self.hand_sides:
             name = f"{side.capitalize()} glove"
             if side not in self.gloves:
                 if not self._due(name, now):
@@ -1584,12 +1839,14 @@ class Dashboard:
         if clearance is not None:
             near = (">=10 cm" if clearance.pair is None
                     else f"{clearance.distance_m * 100:.1f} cm  {clearance.pair}")
-            lines.append(f"Closest parts: {near}")
+            lines.append(f"Closest parts: {near}" + GUARD_NOTES[status["guard"]])
         if "command" in status:
             for side in SIDES:
                 q = np.round(status["command"][side], 2)
+                note = status.get("finger_note", {}).get(side)
                 lines.append(f"{side.capitalize()}:  Pico {status['arm_status'][side]}  |  "
-                             f"glove {status['finger_status'][side]}  |  "
+                             f"glove {status['finger_status'][side]}"
+                             f"{f' ({note})' if note else ''}  |  "
                              f"arm {' '.join(f'{v:+.2f}' for v in q)}")
         self.details.configure(text="\n".join(lines))
         self.log.configure(text="\n".join(status["messages"]))
@@ -1671,10 +1928,24 @@ def main(argv=None):
                         help="Do not connect to the Vega arms or Wuji hands (rehearsal)")
     parser.add_argument("--synthetic-input", action="store_true",
                         help="Replace the arm input and gloves with synthetic input")
-    parser.add_argument("--arm-input", choices=("tracker", "pico-hand"), default="tracker",
+    parser.add_argument("--arm-input", choices=("tracker", "pico-hand", "none"),
+                        default="tracker",
                         help="tracker: PICO Motion Trackers via XRoboToolkit drive all 7 joints "
                              "(GMR IK); pico-hand: DexStream hand tracking drives joints 1-4 "
-                             "and the glove IMUs the wrists")
+                             "and the glove IMUs the wrists; none: the arms are never connected "
+                             "and only the fingers follow the gloves")
+    parser.add_argument("--hands", choices=("both", "left", "right"), default="both",
+                        help="Robot hands (and gloves) to connect")
+    parser.add_argument("--hand-current-limit", type=float,
+                        help="Per-joint finger current limit in A while connected (hands "
+                             "default to 1.5 A; restored on exit)")
+    parser.add_argument("--hand-compliance", action="store_true",
+                        help="HACo-style fingertip force regulation: in contact, bend the "
+                             "glove's finger reference so each fingertip force estimated from "
+                             "motor current stays near --fingertip-force-limit")
+    parser.add_argument("--fingertip-force-limit", type=float, default=4.0,
+                        help="Fingertip force limit for --hand-compliance, in uncalibrated N "
+                             "(SDK placeholder 1 N*m/A); 4 roughly halves a firm grasp")
     parser.add_argument("--ik-config", default=str(TRACKER_IK_CONFIG),
                         help="GMR ik_configs JSON for tracker input")
     parser.add_argument("--left-tracker-sn")
@@ -1700,10 +1971,17 @@ def main(argv=None):
     parser.add_argument("--latency-report", default=time.strftime(
         "/tmp/vega-hardware-latency-%Y%m%d-%H%M%S.json"),
         help="Bounded tracker-to-command and command-to-measured latency report")
+    parser.add_argument("--hand-log", default=time.strftime(
+        "/tmp/vega-hand-log-%Y%m%d-%H%M%S"),
+        help="Path prefix for 1 kHz finger states and commands (about 30 MB/min); "
+             "empty disables")
     parser.add_argument("--proximal-speed", type=float,
                         help="Joints 1-4 slew limit in rad/s (default: --max-arm-speed)")
     parser.add_argument("--wrist-speed", type=float,
                         help="Joints 5-7 slew limit in rad/s (default: --max-arm-speed)")
+    parser.add_argument("--arm-velocity-feedforward", type=float, default=0.0,
+                        help="Times the arm command's rate sent as velocity while following "
+                             "(0 = position only; 1.5 cancels the servo lag on this robot)")
     parser.add_argument("--hand-kp", type=float, default=HAND_MIT_GAINS[0],
                         help="Wuji finger stiffness written to both hands on connect")
     parser.add_argument("--hand-kd", type=float, default=HAND_MIT_GAINS[1],
@@ -1715,6 +1993,10 @@ def main(argv=None):
                  "reset_clearance", "guard_clearance"):
         parser.add_argument("--" + name.replace("_", "-"), type=float,
                             default=getattr(defaults, name))
+    parser.add_argument("--teleop-guard", choices=tuple(GUARD_NOTES), default=defaults.teleop_guard,
+                        help="What holds a teleop target closer than --guard-clearance: all "
+                             "checked pairs; allow-hands, all but left hand against right hand; "
+                             "off, nothing. The reset path always checks all of them.")
     args = parser.parse_args(argv)
     if not 0.0 <= args.reset_shoulder_back <= 0.6:
         parser.error("--reset-shoulder-back must be between 0 and 0.6 rad")
@@ -1724,8 +2006,22 @@ def main(argv=None):
             not 0.0 < proximal_speed <= 2.0 or not 0.0 < wrist_speed <= 2.0 or
             not 0.0 < args.reset_speed <= 0.6):
         parser.error("arm speeds must be positive and at most 2.0 (teleop) / 0.6 (reset) rad/s")
+    if not 0.0 <= args.arm_velocity_feedforward <= 2.0:
+        parser.error("--arm-velocity-feedforward must be in [0, 2]")
     if not (0.0 < args.hand_kp <= 12.0 and 0.0 <= args.hand_kd <= 1.0):
         parser.error("--hand-kp must be in (0, 12] and --hand-kd in [0, 1]")
+    if args.hand_current_limit is not None and not 0.0 < args.hand_current_limit <= 1.5:
+        parser.error("--hand-current-limit must be in (0, 1.5] A")
+    if not 1.0 <= args.fingertip_force_limit <= 30.0:
+        parser.error("--fingertip-force-limit must be in [1, 30] N")
+    hand_compliance = None
+    if args.hand_compliance:
+        from .hand_compliance import ComplianceParams
+
+        limit = args.fingertip_force_limit
+        hand_compliance = ComplianceParams(force_limit=limit, force_on=0.625 * limit,
+                                           force_off=0.375 * limit)
+    hand_sides = SIDES if args.hands == "both" else (args.hands,)
     if not args.fake_robot:
         for name in ("ROBOT_NAME", "ZENOH_CONFIG"):
             if not os.environ.get(name):
@@ -1734,16 +2030,25 @@ def main(argv=None):
         max_arm_speed=args.max_arm_speed, proximal_speed=proximal_speed,
         wrist_speed=wrist_speed, max_hand_speed=args.max_hand_speed,
         reset_speed=args.reset_speed, reset_clearance=args.reset_clearance,
-        guard_clearance=args.guard_clearance, tracking_fault=args.tracking_fault or None)
+        guard_clearance=args.guard_clearance, teleop_guard=args.teleop_guard,
+        tracking_fault=args.tracking_fault or None,
+        arm_velocity_feedforward=args.arm_velocity_feedforward)
+    hand_log = None
+    if args.hand_log:
+        from .hand_log import HandLogger
+
+        hand_log = HandLogger(args.hand_log)
     if args.fake_robot:
         connect_robot, hands_io = functools.partial(FakeArms, reset_pose(0.0)), FakeHands()
     else:
-        connect_robot = DexcontrolArms
+        connect_robot = (functools.partial(HeldArms, reset_pose(args.reset_shoulder_back))
+                         if args.arm_input == "none" else DexcontrolArms)
         hands_io = WujiHands({"left": args.left_hand_sn, "right": args.right_hand_sn},
-                             mit_gains=(args.hand_kp, args.hand_kd))
+                             mit_gains=(args.hand_kp, args.hand_kd), log=hand_log,
+                             current_limit=args.hand_current_limit)
     if args.synthetic_input:
         connect_glove = lambda side: (SyntheticSource(side), HeldWristImu())  # noqa: E731
-        arm_input = SyntheticPicoLinks()
+        arm_input = NoArmInput() if args.arm_input == "none" else SyntheticPicoLinks()
         retargeters = {side: _StaticRetargeter(np.full(20, 0.3)) for side in SIDES}
     else:
         from .retarget import WujiRetargeter
@@ -1756,15 +2061,24 @@ def main(argv=None):
                 XRoboToolkitTrackerSource(), ik_config=args.ik_config,
                 left_serial=args.left_tracker_sn, right_serial=args.right_tracker_sn,
                 human_height=args.human_height)
+        elif args.arm_input == "none":
+            arm_input = NoArmInput()
         else:
             arm_input = PicoLinks(args.pico_scale)
         retargeters = {side: WujiRetargeter(side) for side in SIDES}
     app = TeleopApp(connect_robot=connect_robot, hands_io=hands_io,
                     connect_glove=connect_glove, arm_input=arm_input, retargeters=retargeters,
                     reset_q=reset_pose(args.reset_shoulder_back), limits=limits,
-                    log_csv=args.log_csv, latency_report=args.latency_report)
+                    log_csv=args.log_csv, latency_report=args.latency_report,
+                    hand_log=hand_log, hand_sides=hand_sides, hand_compliance=hand_compliance)
+    if hand_compliance is not None:
+        print(f"Hand compliance on: fingertip force limit {hand_compliance.force_limit:g} N "
+              "(uncalibrated)", flush=True)
     print(f"Logging commanded and measured arm joints to {args.log_csv}", flush=True)
     print(f"Writing wrist latency report to {args.latency_report}", flush=True)
+    if hand_log is not None:
+        print(f"Logging finger states (1 kHz) and commands to {args.hand_log}.*.bin",
+              flush=True)
     cameras = None
     if not args.no_cameras:
         from .robot_cameras import RobotCameras
@@ -1779,6 +2093,10 @@ def main(argv=None):
         if cameras is not None:
             cameras.close()
         app.stop()
+        if hand_log is not None:
+            hand_log.close()
+            if hand_log.dropped:
+                print(f"Finger log dropped {hand_log.dropped} rows", flush=True)
     return 0
 
 

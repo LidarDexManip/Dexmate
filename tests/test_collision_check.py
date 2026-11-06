@@ -67,6 +67,21 @@ class ClearanceTests(unittest.TestCase):
         self.assertLess(clearance.distance_m, 0.0)
         self.assertRegex(clearance.pair, r"^L_arm_l\d <-> R_arm_l\d$")
 
+    def test_leaving_out_hand_to_hand_keeps_every_other_pair(self):
+        checker = ArmClearanceChecker(self.model, self.arms, self.hands, hand_to_hand=False)
+        for side in SIDES:
+            checker.set_fingers(side, np.zeros(20))
+        hands_touch = _shoulders_down(left=0.25, right=-0.25)
+        clearance = self.checker.clearance(hands_touch)
+        self.assertLess(clearance.distance_m, 0.0)
+        self.assertRegex(clearance.pair, r"^l_\w+ <-> r_\w+$")
+        self.assertGreater(checker.clearance(hands_touch).distance_m, 0.015)
+        # Hand into the other arm, and forearm against forearm, are still seen.
+        self.assertRegex(checker.clearance(_shoulders_down(left=0.8)).pair,
+                         r"^l_\w+ <-> R_arm_l\d$")
+        self.assertRegex(checker.clearance(_shoulders_down(left=0.9, right=-0.9)).pair,
+                         r"^L_arm_l\d <-> R_arm_l\d$")
+
     def test_finger_angles_change_hand_clearance(self):
         q = _shoulders_down(left=0.6)
         opened = self.checker.clearance(q).distance_m

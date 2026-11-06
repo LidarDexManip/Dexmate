@@ -31,6 +31,9 @@ class HandFrame:
     timestamp_us: int  # original SDK timestamp, retained for diagnostics
     sequence: int
     confidence: float | None = None
+    # Per fingertip sensor (thumb, index, middle, ring, pinky), from the glove's
+    # EMF poses; None when that stream is missing or stale.
+    finger_confidence: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -52,10 +55,12 @@ class LatestFrameBuffer:
         self._error = None
         self._timestamp = None
 
-    def publish(self, points, *, received_at, timestamp_us, sequence, confidence=None):
+    def publish(self, points, *, received_at, timestamp_us, sequence, confidence=None,
+                finger_confidence=None):
         try:
             points = validate_keypoints(points)
-            frame = HandFrame(points, received_at, timestamp_us, sequence, confidence)
+            frame = HandFrame(points, received_at, timestamp_us, sequence, confidence,
+                              finger_confidence)
         except (ValueError, TypeError, OverflowError) as exc:
             self.fail(str(exc))
             return
@@ -148,6 +153,9 @@ def select_glove(devices, serial=None):
     return matches[0]
 
 
+EMF_STALE_S = 0.5  # fingertip sensor confidence older than this is not reported
+
+
 class GloveSource:
     """A single glove subscription. Never opens a robot-hand command channel."""
 
@@ -158,6 +166,8 @@ class GloveSource:
         self._manager = sdk.SdkManager.instance()
         self._buffer = LatestFrameBuffer()
         self._subscription = None
+        self._emf_subscription = None
+        self._emf = None  # (monotonic time, per-sensor confidence thumb..pinky)
         self._glove = None
         self._previous_user = None
         # The SDK identifies live connections by device_name.  Keep the legacy
@@ -187,6 +197,7 @@ class GloveSource:
             if self.side not in ("left", "right"):
                 raise ValueError(f"Unsupported glove side: {self.side!r}")
             self.firmware = self._glove.version().get()
+            self._subscribe_emf()
             self._subscription = self._glove.hand_skeleton().subscribe_with_callback(
                 self._on_frame, on_error=self._buffer.fail,
             )
@@ -194,10 +205,33 @@ class GloveSource:
             self.close()
             raise
 
+    def _subscribe_emf(self):
+        # Fingertip sensor confidence, for FingerStandIn. Optional: without it
+        # the teleop just never swaps a finger. The skeleton's own per-joint
+        # confidence is no substitute: healthy fingers dip to 0.4-0.5 in it.
+        try:
+            self._emf_subscription = self._glove.emf_poses().subscribe_with_callback(
+                self._on_emf)
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"Glove fingertip sensor confidence unavailable: {exc}",
+                          RuntimeWarning)
+
+    def _on_emf(self, frame):
+        # Five fingertip sensors, thumb to pinky; a sensor with no reading
+        # reports confidence 0 at position 0.
+        try:
+            confidence = tuple(float(p.confidence) for p in frame.poses)
+        except (TypeError, AttributeError, ValueError):
+            return
+        if len(confidence) == 5:
+            self._emf = (time.monotonic(), confidence)
+
     def _on_frame(self, skeleton):
         try:
             timestamp = int(skeleton.header.timestamp_us)
             received_at = time.monotonic()
+            emf = self._emf
             # SDK timestamps are synchronized to host UTC. Account for transport
             # delay as well as time spent waiting in our own latest-frame slot.
             transport_age = max(0.0, time.time() - timestamp / 1e6)
@@ -208,6 +242,8 @@ class GloveSource:
                 received_at=received_at - transport_age, timestamp_us=timestamp,
                 sequence=int(skeleton.header.seq),
                 confidence=min(j.confidence for j in skeleton.joints),
+                finger_confidence=(emf[1] if emf is not None
+                                   and received_at - emf[0] < EMF_STALE_S else None),
             )
         except (ValueError, TypeError, AttributeError, OverflowError) as exc:
             self._buffer.fail(f"Invalid skeleton: {exc}")
@@ -256,6 +292,8 @@ class GloveSource:
         actions = []
         if self._subscription is not None:
             actions.append(self._subscription.close)
+        if self._emf_subscription is not None:
+            actions.append(self._emf_subscription.close)
         if self._glove is not None:
             actions.append(lambda: self._manager.disconnect(self._device_name))
         if self._previous_user is not None:

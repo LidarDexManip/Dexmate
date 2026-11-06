@@ -9,7 +9,8 @@ each mesh's convex hull, which over-approximates the part) between:
 * each Wuji hand and its own shoulder and upper arm.
 
 Both hands are part of every check, at the finger angles last given to
-:meth:`ArmClearanceChecker.set_fingers`.
+:meth:`ArmClearanceChecker.set_fingers`. The scene holds only the robot: a table
+or anything else around it is not checked.
 """
 
 from __future__ import annotations
@@ -54,9 +55,12 @@ def joint_distance(a, b):
 
 
 class ArmClearanceChecker:
-    """Minimum mesh distance between the body parts that can collide."""
+    """Minimum mesh distance between the body parts that can collide.
 
-    def __init__(self, model, arms, hands):
+    ``hand_to_hand=False`` leaves out only the left hand against the right hand.
+    """
+
+    def __init__(self, model, arms, hands, *, hand_to_hand=True):
         self.model = model
         self.data = mujoco.MjData(model)
         self.arms = arms
@@ -97,8 +101,10 @@ class ArmClearanceChecker:
                 raise ValueError(f"Bimanual scene is missing {side} arm or hand meshes")
             pairs += itertools.product(link(side, 3, 8) + hand(side), torso)
             pairs += itertools.product(hand(side), link(side, 1, 4))
-        pairs += itertools.product(link("left", 2, 8) + hand("left"),
-                                   link("right", 2, 8) + hand("right"))
+        pairs += itertools.product(link("left", 2, 8) + hand("left"), link("right", 2, 8))
+        pairs += itertools.product(link("left", 2, 8), hand("right"))
+        if hand_to_hand:
+            pairs += itertools.product(hand("left"), hand("right"))
         self._pairs = np.array(pairs, dtype=np.int64)
         self._bound = (model.geom_rbound[self._pairs[:, 0]] +
                        model.geom_rbound[self._pairs[:, 1]])

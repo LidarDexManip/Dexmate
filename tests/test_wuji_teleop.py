@@ -162,6 +162,50 @@ class GloveTests(unittest.TestCase):
         self.assertEqual(manager.switch_user.call_args_list[-1].args, ("previous",))
         glove.enable.assert_not_called()
 
+    def test_frames_carry_fresh_fingertip_sensor_confidence(self):
+        sdk, _, glove, _ = fake_sdk()
+        source = GloveSource(sdk=sdk)
+        try:
+            on_skeleton = glove.hand_skeleton().subscribe_with_callback.call_args.args[0]
+            emf = glove.emf_poses().subscribe_with_callback
+            on_emf = emf.call_args.args[0]
+            points = synthetic_keypoints(0, "left")
+            start = time.time_ns() // 1000
+
+            def skeleton(count=iter(range(1, 100))):
+                n = next(count)  # strictly newer timestamps, or the buffer drops the frame
+                return NS(header=NS(timestamp_us=start + n, seq=n),
+                          joints=[NS(pose=NS(position=p), confidence=0.9) for p in points])
+
+            on_skeleton(skeleton())  # no sensor frame yet
+            self.assertIsNone(source.read().frame.finger_confidence)
+            on_emf(NS(poses=[NS(confidence=c) for c in (0.97, 0.98, 0.98, 0.0, 0.96)]))
+            on_skeleton(skeleton())
+            self.assertEqual(source.read().frame.finger_confidence,
+                             (0.97, 0.98, 0.98, 0.0, 0.96))
+            self.assertEqual(source.read().frame.confidence, 0.9)
+            with patch("wuji_teleop.sources.time.monotonic",
+                       return_value=time.monotonic() + 1.0):
+                on_skeleton(skeleton())  # the sensor stream went quiet
+            self.assertIsNone(source.read().frame.finger_confidence)
+        finally:
+            source.close()
+        emf.return_value.close.assert_called_once()
+
+    def test_glove_without_fingertip_confidence_still_connects(self):
+        sdk, _, glove, _ = fake_sdk()
+        glove.emf_poses.side_effect = RuntimeError("no such topic")
+        with self.assertWarnsRegex(RuntimeWarning, "fingertip sensor confidence"):
+            source = GloveSource(sdk=sdk)
+        try:
+            on_skeleton = glove.hand_skeleton().subscribe_with_callback.call_args.args[0]
+            on_skeleton(NS(header=NS(timestamp_us=time.time_ns() // 1000, seq=1),
+                           joints=[NS(pose=NS(position=p), confidence=0.9)
+                                   for p in synthetic_keypoints(0, "left")]))
+            self.assertIsNone(source.read().frame.finger_confidence)
+        finally:
+            source.close()
+
     def test_custom_device_name_supports_parallel_connections(self):
         sdk, manager, _, _ = fake_sdk()
         source = GloveSource(sdk=sdk, device_name="wuji_bimanual_glove_left")

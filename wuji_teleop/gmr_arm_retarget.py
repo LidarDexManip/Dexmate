@@ -498,7 +498,7 @@ class GmrArmRetargeter:
 class PoseTargetFilter:
     """Low-pass and rate-limit one 6D target so tracker glitches cannot fling the arm."""
 
-    def __init__(self, tau_s=0.05, max_speed_m_s=1.0, max_angular_speed_rad_s=6.0):
+    def __init__(self, tau_s=0.04, max_speed_m_s=1.0, max_angular_speed_rad_s=7.0):
         self.tau_s = float(tau_s)
         self.max_speed_m_s = float(max_speed_m_s)
         self.max_angular_speed_rad_s = float(max_angular_speed_rad_s)

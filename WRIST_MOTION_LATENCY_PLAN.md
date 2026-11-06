@@ -26,6 +26,27 @@ writes `--latency-report` JSON at shutdown. Use:
 1.0 rad/s behavior; evaluate wrist values of 1.0, 1.5 and 2.0 in fake-robot and
 MuJoCo runs before requesting a physical Vega trial.
 
+## Findings, 2026-11-04
+
+Where the delay sits, from the 11-01 tracking logs (227 s running) and an offline
+replay of the filter and IK: tracker frame age 25 ms on average (over 100 ms for
+4-6% of the time, about 28 frames/s), filter about 29 ms at tau 40 ms, IK none
+(0.4 ms to solve), control loop to command 10-22 ms, speed limiter 0-60 ms, and
+command to measured about 300 ms or more. Delay before the laptop gets a tracker
+frame is not measured.
+
+The arm is a first-order lag, the same on all joints: gain 0.36 and 231-240 ms
+late at 1 Hz, measured on right joints 1 and 5 with small sinusoids. Fit over the
+joint 5 cases: servo tau 0.415 s, feedforward effectiveness 0.67, transport delay
+47 ms, so velocity feedforward scaled by 1 / 0.67 cancels the lag. Measured at
+scale 1.5: gain 0.99-1.04, delay 35-44 ms, stable. The same model reproduces the
+real arm on teleop motions to 3 mrad, and replaying those logs predicts lag falling
+from 340 ms to about 130 ms with `--arm-velocity-feedforward 1.5`, smoothing the
+velocity over 100 ms because tracker frames arrive in steps.
+
+Not yet done: tracker-driven motion on the real arm with feedforward, joints other
+than 1 and 5, the left arm, and speeds above 0.63 rad/s.
+
 ## Hardware observations and follow-up
 
 The first saved hardware CSV had 1,003 running samples. Mapping/IK p95 was
