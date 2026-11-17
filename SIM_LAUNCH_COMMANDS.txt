@@ -86,3 +86,13 @@ scripts/launch_vega_ee_preview.sh
 # Open http://127.0.0.1:8088; optional physical glove: --glove --side right
 # Physical robot ONLY when explicitly intended: --hardware --glove --side right
 # See EE_PREVIEW_RUNBOOK.md for preview, keyboard/drag controls, and table alignment.
+
+# Human demonstration capture (no robot): gloves + PICO trackers + headset stereo.
+# See HUMAN_DEMO_CAPTURE.md. Record (Ctrl-C stops; stop the headset Record first):
+scripts/record_human_demo.sh --out ~/vega-demos/<name>
+# Process in ~/Desktop/retargeting/.venv-vision, one stage at a time:
+scripts/process_human_demo.sh pull|inspect|hands|depth|track|ground|export ~/vega-demos/<name>
+scripts/process_human_demo.sh view ~/vega-demos/<name> --mesh /path/to/object.obj   # http://localhost:8120
+# Live PICO stereo passthrough on the laptop (stock XRoboToolkit app; camera access needed;
+# not while the headset records). Keys s save PNG, t on top, q quit. --record PREFIX saves the H.264:
+scripts/launch_pico_stereo_view.sh --headset <headset-wifi-ip>
